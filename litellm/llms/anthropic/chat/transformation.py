@@ -184,14 +184,10 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
     @staticmethod
     def _is_opus_4_6_model(model: str) -> bool:
-        """Claude Opus 4.6+ (includes Opus 4.7). Supports effort max/xhigh."""
+        """Check if the model is specifically Claude Opus 4.6."""
         model_lower = model.lower()
         return any(
-            v in model_lower
-            for v in (
-                "opus-4-6", "opus_4_6", "opus-4.6", "opus_4.6",
-                "opus-4-7", "opus_4_7", "opus-4.7", "opus_4.7",
-            )
+            v in model_lower for v in ("opus-4-6", "opus_4_6", "opus-4.6", "opus_4.6")
         )
 
     @staticmethod

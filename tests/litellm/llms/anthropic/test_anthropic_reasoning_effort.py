@@ -137,30 +137,6 @@ class TestMapOpenAIParamsReasoningEffort:
         }
 
 
-class TestOpus47AdaptiveThinking:
-    def test_opus_4_7_medium_uses_adaptive_not_budget_tokens(self):
-        """Opus 4.7 rejects manual budget_tokens; must use adaptive + output_config."""
-        result = AnthropicConfig().map_openai_params(
-            non_default_params={"reasoning_effort": "medium"},
-            optional_params={},
-            model="claude-opus-4-7",
-            drop_params=False,
-        )
-        assert result["thinking"] == {"type": "adaptive"}
-        assert result["output_config"] == {"effort": "medium"}
-        assert "budget_tokens" not in result.get("thinking", {})
-
-    def test_opus_4_7_disable_has_no_thinking(self):
-        result = AnthropicConfig().map_openai_params(
-            non_default_params={"reasoning_effort": "disable"},
-            optional_params={},
-            model="claude-opus-4-7",
-            drop_params=False,
-        )
-        assert "thinking" not in result
-        assert "output_config" not in result
-
-
 class TestResponsesApiReasoningWithSummary:
     def test_reasoning_with_summary_extracts_string_effort(self):
         """show_reasoning must not pass a dict reasoning_effort to chat completion."""

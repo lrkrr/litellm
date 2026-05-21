@@ -241,11 +241,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
     @staticmethod
     def _is_claude_4_6_model(model: str) -> bool:
-        """Claude 4.6+ models that use adaptive thinking + output_config effort.
-
-        Includes Opus/Sonnet 4.6 and 4.7. Manual ``thinking: {type: enabled,
-        budget_tokens: N}`` is not supported on these models (400 from Anthropic).
-        """
+        """Check if the model is a Claude 4.6 model (Opus 4.6 or Sonnet 4.6)."""
         model_lower = model.lower()
         return any(
             v in model_lower
@@ -258,14 +254,6 @@ class AnthropicModelInfo(BaseLLMModelInfo):
                 "sonnet_4_6",
                 "sonnet-4.6",
                 "sonnet_4.6",
-                "opus-4-7",
-                "opus_4_7",
-                "opus-4.7",
-                "opus_4.7",
-                "sonnet-4-7",
-                "sonnet_4_7",
-                "sonnet-4.7",
-                "sonnet_4.7",
             )
         )
 

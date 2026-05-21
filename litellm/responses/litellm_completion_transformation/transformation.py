@@ -192,6 +192,9 @@ class LiteLLMCompletionResponsesConfig:
                 reasoning_effort = reasoning_param.get("effort")
             elif isinstance(reasoning_param, str):
                 reasoning_effort = reasoning_param
+        # Chat completion providers expect a string effort
+        if isinstance(reasoning_effort, dict):
+            reasoning_effort = reasoning_effort.get("effort")
 
         litellm_completion_request: dict = {
             "messages": LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
