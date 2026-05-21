@@ -184,10 +184,14 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
     @staticmethod
     def _is_opus_4_6_model(model: str) -> bool:
-        """Check if the model is specifically Claude Opus 4.6."""
+        """Claude Opus 4.6+ (includes Opus 4.7). Supports effort max/xhigh."""
         model_lower = model.lower()
         return any(
-            v in model_lower for v in ("opus-4-6", "opus_4_6", "opus-4.6", "opus_4.6")
+            v in model_lower
+            for v in (
+                "opus-4-6", "opus_4_6", "opus-4.6", "opus_4.6",
+                "opus-4-7", "opus_4_7", "opus-4.7", "opus_4.7",
+            )
         )
 
     @staticmethod
@@ -247,6 +251,24 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             params.append("reasoning_effort")
 
         return params
+
+    def is_thinking_enabled(self, non_default_params: dict) -> bool:
+        thinking = non_default_params.get("thinking")
+        if isinstance(thinking, dict):
+            thinking_type = thinking.get("type")
+            if thinking_type in ("enabled", "adaptive"):
+                return True
+            if thinking_type in ("disabled", "none"):
+                return False
+        normalized_effort = AnthropicConfig._normalize_reasoning_effort_param(
+            non_default_params.get("reasoning_effort")
+        )
+        if normalized_effort is not None and normalized_effort not in (
+            "none",
+            "disable",
+        ):
+            return True
+        return False
 
     @staticmethod
     def filter_anthropic_output_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -791,11 +813,31 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         return new_stop
 
     @staticmethod
+    def _normalize_reasoning_effort_param(
+        value: Optional[Union[REASONING_EFFORT, str, dict]],
+    ) -> Optional[str]:
+        """Normalize reasoning_effort from string or Responses API dict format.
+
+        OpenAI Agents / Responses API may pass:
+        ``{"effort": "low", "summary": "auto"}``. Anthropic only accepts a string effort.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            effort = value.get("effort")
+            if effort is None:
+                return None
+            return str(effort)
+        return None
+
+    @staticmethod
     def _map_reasoning_effort(
         reasoning_effort: Optional[Union[REASONING_EFFORT, str]],
         model: str,
     ) -> Optional[AnthropicThinkingParam]:
-        if reasoning_effort is None or reasoning_effort == "none":
+        if reasoning_effort is None or reasoning_effort in ("none", "disable"):
             return None
         if AnthropicConfig._is_claude_4_6_model(
             model
@@ -1087,15 +1129,23 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 optional_params["metadata"] = {"user_id": value}
             elif param == "thinking":
                 optional_params["thinking"] = value
-            elif param == "reasoning_effort" and isinstance(value, str):
-                optional_params["thinking"] = AnthropicConfig._map_reasoning_effort(
-                    reasoning_effort=value, model=model
+            elif param == "reasoning_effort":
+                normalized_effort = AnthropicConfig._normalize_reasoning_effort_param(
+                    value
                 )
+                if normalized_effort is None:
+                    continue
+                mapped_thinking = AnthropicConfig._map_reasoning_effort(
+                    reasoning_effort=normalized_effort, model=model
+                )
+                if mapped_thinking is not None:
+                    optional_params["thinking"] = mapped_thinking
                 # For Claude 4.6+ models, effort is controlled via output_config,
                 # not thinking budget_tokens. Map reasoning_effort to output_config.
-                if AnthropicConfig._is_claude_4_6_model(
-                    model
-                ) or AnthropicConfig._is_claude_4_7_model(model):
+                if (
+                    AnthropicConfig._is_claude_4_6_model(model)
+                    or AnthropicConfig._is_claude_4_7_model(model)
+                ) and normalized_effort not in ("none", "disable"):
                     effort_map = {
                         "low": "low",
                         "minimal": "low",
@@ -1104,7 +1154,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                         "xhigh": "xhigh",
                         "max": "max",
                     }
-                    mapped_effort = effort_map.get(value, value)
+                    mapped_effort = effort_map.get(
+                        normalized_effort, normalized_effort
+                    )
                     optional_params["output_config"] = {"effort": mapped_effort}
             elif param == "web_search_options" and isinstance(value, dict):
                 hosted_web_search_tool = self.map_web_search_tool(

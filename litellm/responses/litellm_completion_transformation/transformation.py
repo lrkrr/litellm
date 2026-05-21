@@ -181,22 +181,16 @@ class LiteLLMCompletionResponsesConfig:
                 text_param
             )
 
-        # Extract reasoning_effort from reasoning parameter
+        # Extract reasoning_effort string from reasoning parameter for chat completion.
+        # Always use the effort string (never pass the full reasoning dict): Anthropic's
+        # map_openai_params only maps string reasoning_effort to thinking (see #24599).
+        # reasoning.summary is an output-only flag and stays on responses_api_request.
         reasoning_effort: Optional[Union[Reasoning, str]] = None
         reasoning_param = responses_api_request.get("reasoning")
         if reasoning_param:
             if isinstance(reasoning_param, dict):
-                # reasoning can be {"effort": "low|medium|high", "summary": "detailed"}
-                # Keep the full dict when summary is set so the responses API bridge can
-                # forward it; otherwise use the effort string for chat completion (e.g. Gemini).
-                if "summary" in reasoning_param:
-                    reasoning_effort = reasoning_param
-                elif "effort" in reasoning_param:
-                    reasoning_effort = reasoning_param.get("effort")
-                else:
-                    reasoning_effort = reasoning_param
+                reasoning_effort = reasoning_param.get("effort")
             elif isinstance(reasoning_param, str):
-                # reasoning could be a string directly
                 reasoning_effort = reasoning_param
 
         litellm_completion_request: dict = {
