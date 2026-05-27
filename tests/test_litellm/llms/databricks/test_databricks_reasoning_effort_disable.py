@@ -1,17 +1,16 @@
 """
 Regression test for ``reasoning_effort="disable"`` on Claude via Databricks.
 
-Same root cause as the Bedrock regression: our fork's
-``AnthropicConfig._map_reasoning_effort`` returns ``None`` for ``"disable"``,
-and the Databricks helper used to write that ``None`` straight into
-``optional_params["thinking"]``.
+Pins the explicit ``thinking: {"type": "disabled"}`` wire format (rather than
+omitting the param) so disable works correctly on models where
+omit-defaults-to-off is not documented.
 """
 
 from litellm.llms.databricks.chat.transformation import DatabricksConfig
 
 
 class TestDatabricksReasoningEffortDisable:
-    def test_disable_does_not_set_thinking_key(self):
+    def test_disable_sends_explicit_disabled_thinking(self):
         config = DatabricksConfig()
         optional_params = config.map_openai_params(
             non_default_params={"reasoning_effort": "disable"},
@@ -19,9 +18,9 @@ class TestDatabricksReasoningEffortDisable:
             model="databricks-claude-sonnet-4",
             drop_params=False,
         )
-        assert "thinking" not in optional_params
+        assert optional_params["thinking"] == {"type": "disabled"}
 
-    def test_none_does_not_set_thinking_key(self):
+    def test_none_sends_explicit_disabled_thinking(self):
         config = DatabricksConfig()
         optional_params = config.map_openai_params(
             non_default_params={"reasoning_effort": "none"},
@@ -29,7 +28,7 @@ class TestDatabricksReasoningEffortDisable:
             model="databricks-claude-sonnet-4",
             drop_params=False,
         )
-        assert "thinking" not in optional_params
+        assert optional_params["thinking"] == {"type": "disabled"}
 
     def test_low_still_sets_thinking(self):
         config = DatabricksConfig()

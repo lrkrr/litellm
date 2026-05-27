@@ -89,7 +89,7 @@ class TestAnthropicEndToEndFromBridge:
         assert anthropic["thinking"] == {"type": "adaptive"}
         assert anthropic["output_config"] == {"effort": "medium"}
 
-    def test_disable_from_bridge_disables_thinking(self):
+    def test_disable_from_bridge_sends_explicit_disabled_thinking(self):
         completion = _bridge("claude-sonnet-4-6", {"effort": "disable", "summary": "auto"})
         anthropic = AnthropicConfig().map_openai_params(
             non_default_params={"reasoning_effort": completion["reasoning_effort"]},
@@ -97,7 +97,7 @@ class TestAnthropicEndToEndFromBridge:
             model="claude-sonnet-4-6",
             drop_params=False,
         )
-        assert "thinking" not in anthropic
+        assert anthropic["thinking"] == {"type": "disabled"}
         assert "output_config" not in anthropic
 
 

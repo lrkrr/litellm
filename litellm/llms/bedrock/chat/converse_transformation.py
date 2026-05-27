@@ -454,8 +454,6 @@ class AmazonConverseConfig(BaseConfig):
             )
             if mapped_thinking is not None:
                 optional_params["thinking"] = mapped_thinking
-            else:
-                optional_params.pop("thinking", None)
 
     @staticmethod
     def _clamp_thinking_budget_tokens(optional_params: dict) -> None:

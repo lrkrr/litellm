@@ -1,24 +1,18 @@
 """
 Regression tests for ``reasoning_effort="disable"`` on Anthropic-via-Bedrock.
 
-Background: our fork's ``AnthropicConfig._map_reasoning_effort`` returns
-``None`` for ``"none"`` and ``"disable"``. The Bedrock Converse helper used
-to write that ``None`` straight into ``optional_params["thinking"]``, which
-caused ``is_thinking_enabled`` to crash with::
-
-    'NoneType' object has no attribute 'get'
-
-The fix is twofold:
-
-1. The Bedrock helper now only sets ``thinking`` when the mapping is non-None.
-2. The base ``is_thinking_enabled`` is defensive against ``thinking=None``.
+Our fork's ``AnthropicConfig._map_reasoning_effort`` now returns
+``{"type": "disabled"}`` for ``"none"`` and ``"disable"`` (was previously
+``None``, which both (a) crashed ``is_thinking_enabled`` downstream and
+(b) relied on omit-defaults-to-off semantics that are not documented for
+every Claude model). These tests pin the explicit-disabled wire format.
 """
 
 from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
 
 
 class TestBedrockReasoningEffortDisable:
-    def test_disable_does_not_set_thinking_key(self):
+    def test_disable_sends_explicit_disabled_thinking(self):
         config = AmazonConverseConfig()
         optional_params = config.map_openai_params(
             non_default_params={"reasoning_effort": "disable"},
@@ -26,15 +20,12 @@ class TestBedrockReasoningEffortDisable:
             model="anthropic.claude-sonnet-4-6-v1",
             drop_params=False,
         )
-        # No thinking key, no crash. Either absent or non-None.
-        assert optional_params.get("thinking") is None
-        assert "thinking" not in optional_params
+        assert optional_params["thinking"] == {"type": "disabled"}
 
     def test_disable_does_not_crash_with_max_tokens_resolution(self):
         """Repro of the original 400: update_optional_params_with_thinking_tokens
-        used to AttributeError on ``thinking=None``."""
+        used to AttributeError when thinking was None."""
         config = AmazonConverseConfig()
-        # Should not raise.
         config.map_openai_params(
             non_default_params={"reasoning_effort": "disable"},
             optional_params={},
@@ -42,7 +33,7 @@ class TestBedrockReasoningEffortDisable:
             drop_params=False,
         )
 
-    def test_none_does_not_set_thinking_key(self):
+    def test_none_sends_explicit_disabled_thinking(self):
         config = AmazonConverseConfig()
         optional_params = config.map_openai_params(
             non_default_params={"reasoning_effort": "none"},
@@ -50,7 +41,7 @@ class TestBedrockReasoningEffortDisable:
             model="anthropic.claude-sonnet-4-6-v1",
             drop_params=False,
         )
-        assert "thinking" not in optional_params
+        assert optional_params["thinking"] == {"type": "disabled"}
 
     def test_low_still_sets_thinking(self):
         config = AmazonConverseConfig()
@@ -67,7 +58,7 @@ class TestBedrockReasoningEffortDisable:
 
 
 class TestIsThinkingEnabledDefensive:
-    """``thinking`` may be present with value ``None`` after upstream mapping."""
+    """``is_thinking_enabled`` must treat ``disabled`` and missing/None as off."""
 
     def test_none_thinking_value_is_not_enabled(self):
         config = AmazonConverseConfig()

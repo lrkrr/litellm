@@ -336,8 +336,6 @@ class DatabricksConfig(DatabricksBase, OpenAILikeChatConfig, AnthropicConfig):
             )
             if mapped_thinking is not None:
                 optional_params["thinking"] = mapped_thinking
-            else:
-                optional_params.pop("thinking", None)
             optional_params.pop("reasoning_effort", None)
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
