@@ -9114,6 +9114,11 @@ class Router:
         - filter models above rpm limits
         - if region given, filter out models not in that region / unknown region
         - [TODO] function call and model doesn't support function calling
+
+        Each check is only performed when the deployment has the relevant
+        configuration variable set (e.g. ``max_input_tokens`` in ``model_info``,
+        ``rpm`` in ``litellm_params``).  Expensive operations like tokenization
+        and model-info lookups are skipped for deployments that don't need them.
         """
 
         verbose_router_logger.debug(
@@ -9126,99 +9131,123 @@ class Router:
 
         invalid_model_indices = set()  # Use set for O(1) membership checks
 
-        try:
-            input_tokens = litellm.token_counter(messages=messages)
-        except Exception as e:
-            verbose_router_logger.error(
-                "litellm.router.py::_pre_call_checks: failed to count tokens. Returning initial list of deployments. Got - {}".format(
-                    str(e)
-                )
-            )
-            return _returned_deployments
+        # Lazy token count: only computed on the first deployment that needs it
+        input_tokens: Optional[int] = None
 
         _context_window_error = False
         _potential_error_str = ""
         _rate_limit_error = False
         parent_otel_span = _get_parent_otel_span_from_kwargs(request_kwargs)
 
-        ## get model group RPM ##
-        dt = get_utc_datetime()
-        current_minute = dt.strftime("%H-%M")
-        rpm_key = f"{model}:rpm:{current_minute}"
-        model_group_cache = (
-            self.cache.get_cache(
-                key=rpm_key, local_only=True, parent_otel_span=parent_otel_span
+        # Pre-compute whether any deployment has RPM configured to avoid
+        # unnecessary cache lookups when no deployment uses RPM.
+        _any_deployment_has_rpm = (
+            self.routing_strategy != "usage-based-routing-v2"
+            and any(
+                (d.get("litellm_params") or {}).get("rpm") is not None
+                for d in _returned_deployments
             )
-            or {}
-        )  # check the in-memory cache used by lowest_latency and usage-based routing. Only check the local cache.
+        )
+        model_group_cache: Optional[dict] = None
+        if _any_deployment_has_rpm:
+            dt = get_utc_datetime()
+            current_minute = dt.strftime("%H-%M")
+            rpm_key = f"{model}:rpm:{current_minute}"
+            model_group_cache = (
+                self.cache.get_cache(
+                    key=rpm_key, local_only=True, parent_otel_span=parent_otel_span
+                )
+                or {}
+            )
+
         for idx, deployment in enumerate(_returned_deployments):
-            # Cache nested dict access to avoid repeated temporary dict allocations
             _litellm_params = deployment.get("litellm_params", {})
             _model_info = deployment.get("model_info", {})
 
-            # see if we have the info for this model
-            _deployment_model = None  # per-deployment model name (avoids overwriting the outer `model` group name)
-            try:
-                base_model = _model_info.get("base_model", None)
-                if base_model is None:
-                    base_model = _litellm_params.get("base_model", None)
-                model_info = self.get_router_model_info(
-                    deployment=deployment, received_model_name=model
-                )
-                _deployment_model = base_model or _litellm_params.get("model", None)
+            ## CONTEXT WINDOW CHECK ##
+            # Only run when the deployment has max_input_tokens explicitly set
+            # in model_info (user-configured). This avoids the expensive
+            # get_router_model_info() call and tokenization for deployments
+            # that don't need context window filtering.
+            _deployment_model = None
+            if _model_info.get("max_input_tokens") is not None:
+                try:
+                    base_model = _model_info.get("base_model", None)
+                    if base_model is None:
+                        base_model = _litellm_params.get("base_model", None)
+                    model_info = self.get_router_model_info(
+                        deployment=deployment, received_model_name=model
+                    )
+                    _deployment_model = base_model or _litellm_params.get(
+                        "model", None
+                    )
 
-                if (
-                    isinstance(model_info, dict)
-                    and model_info.get("max_input_tokens", None) is not None
-                ):
                     if (
-                        isinstance(model_info["max_input_tokens"], int)
-                        and input_tokens > model_info["max_input_tokens"]
+                        isinstance(model_info, dict)
+                        and model_info.get("max_input_tokens", None) is not None
+                        and isinstance(model_info["max_input_tokens"], int)
                     ):
-                        invalid_model_indices.add(idx)
-                        _context_window_error = True
-                        _potential_error_str += (
-                            "Model={}, Max Input Tokens={}, Got={}".format(
-                                _deployment_model,
-                                model_info["max_input_tokens"],
-                                input_tokens,
+                        if input_tokens is None:
+                            try:
+                                input_tokens = litellm.token_counter(
+                                    messages=messages
+                                )
+                            except Exception as e:
+                                verbose_router_logger.error(
+                                    "litellm.router.py::_pre_call_checks: failed to count tokens. "
+                                    "Skipping context window checks. Got - {}".format(
+                                        str(e)
+                                    )
+                                )
+                                input_tokens = -1
+
+                        if (
+                            input_tokens > 0
+                            and input_tokens > model_info["max_input_tokens"]
+                        ):
+                            invalid_model_indices.add(idx)
+                            _context_window_error = True
+                            _potential_error_str += (
+                                "Model={}, Max Input Tokens={}, Got={}".format(
+                                    _deployment_model,
+                                    model_info["max_input_tokens"],
+                                    input_tokens,
+                                )
                             )
-                        )
-                        continue
-            except Exception as e:
-                verbose_router_logger.exception("An error occurs - {}".format(str(e)))
+                            continue
+                except Exception as e:
+                    verbose_router_logger.exception(
+                        "An error occurs - {}".format(str(e))
+                    )
 
-            model_id = _model_info.get("id", "")
             ## RPM CHECK ##
-            ### get local router cache ###
-            current_request_cache_local = (
-                self.cache.get_cache(
-                    key=model_id, local_only=True, parent_otel_span=parent_otel_span
-                )
-                or 0
-            )
-            ### get usage based cache ###
             if (
-                isinstance(model_group_cache, dict)
-                and self.routing_strategy != "usage-based-routing-v2"
+                _any_deployment_has_rpm
+                and isinstance(_litellm_params, dict)
+                and _litellm_params.get("rpm") is not None
+                and isinstance(model_group_cache, dict)
             ):
+                model_id = _model_info.get("id", "")
+                current_request_cache_local = (
+                    self.cache.get_cache(
+                        key=model_id,
+                        local_only=True,
+                        parent_otel_span=parent_otel_span,
+                    )
+                    or 0
+                )
                 model_group_cache[model_id] = model_group_cache.get(model_id, 0)
-
                 current_request = max(
                     current_request_cache_local, model_group_cache[model_id]
                 )
 
                 if (
-                    isinstance(_litellm_params, dict)
-                    and _litellm_params.get("rpm", None) is not None
+                    isinstance(_litellm_params["rpm"], int)
+                    and _litellm_params["rpm"] <= current_request
                 ):
-                    if (
-                        isinstance(_litellm_params["rpm"], int)
-                        and _litellm_params["rpm"] <= current_request
-                    ):
-                        invalid_model_indices.add(idx)
-                        _rate_limit_error = True
-                        continue
+                    invalid_model_indices.add(idx)
+                    _rate_limit_error = True
+                    continue
 
             ## REGION CHECK ##
             if (
@@ -9237,7 +9266,8 @@ class Router:
 
             ## INVALID PARAMS ## -> catch 'gpt-3.5-turbo-16k' not supporting 'response_format' param
             if request_kwargs is not None and litellm.drop_params is False:
-                # get supported params — use per-deployment model to avoid overwriting the outer model group name
+                if _deployment_model is None:
+                    _deployment_model = _litellm_params.get("model", None)
                 _dep_model_for_params = _deployment_model or model
                 (
                     _dep_model_for_params,
@@ -9257,15 +9287,12 @@ class Router:
                 if supported_openai_params is None:
                     continue
                 else:
-                    # check the non-default openai params in request kwargs
                     non_default_params = litellm.utils.get_non_default_params(
                         passed_params=request_kwargs
                     )
                     special_params = ["response_format"]
-                    # check if all params are supported
                     for k, v in non_default_params.items():
                         if k not in supported_openai_params and k in special_params:
-                            # if not -> invalid model
                             verbose_router_logger.debug(
                                 f"INVALID MODEL INDEX @ REQUEST KWARG FILTERING, k={k}"
                             )
