@@ -71,6 +71,9 @@ from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
+from litellm.responses.litellm_completion_transformation.transformation import (
+    LiteLLMCompletionResponsesConfig,
+)
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
 from litellm.router_strategy.lowest_cost import LowestCostLoggingHandler
@@ -3840,6 +3843,45 @@ class Router:
             )
         return kwargs
 
+    def _model_group_has_max_input_tokens(self, model: str) -> bool:
+        """
+        Return True if any deployment in the model group has max_input_tokens set.
+        """
+        deployments = self.get_model_list(model_name=model) or []
+        for deployment in deployments:
+            model_info = deployment.get("model_info")
+            if (
+                isinstance(model_info, dict)
+                and model_info.get("max_input_tokens") is not None
+            ):
+                return True
+        return False
+
+    def _get_messages_for_pre_call_check(
+        self, model: str, kwargs: Dict[str, Any]
+    ) -> Optional[List[Any]]:
+        """
+        Return messages for _pre_call_checks, converting Responses API input only
+        when it is needed for max_input_tokens checks.
+        """
+        messages = kwargs.get("messages")
+        if messages is not None:
+            return messages
+
+        is_responses_api = kwargs.pop("_responses_api_pre_call_check", False)
+        if (
+            not is_responses_api
+            or not self.enable_pre_call_checks
+            or kwargs.get("input") is None
+            or not self._model_group_has_max_input_tokens(model)
+        ):
+            return None
+
+        return LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+            input=kwargs["input"],
+            responses_api_request=kwargs,
+        )
+
     async def _ageneric_api_call_with_fallbacks_helper(
         self, model: str, original_generic_function: Callable, **kwargs
     ):
@@ -3852,10 +3894,11 @@ class Router:
         try:
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
             try:
+                messages = self._get_messages_for_pre_call_check(model, kwargs)
                 deployment = await self.async_get_available_deployment(
                     model=model,
                     request_kwargs=kwargs,
-                    messages=kwargs.get("messages", None),
+                    messages=messages,
                     specific_deployment=kwargs.pop("specific_deployment", None),
                 )
             except Exception as e:
@@ -3963,9 +4006,10 @@ class Router:
                 kwargs=kwargs,
                 metadata_variable_name=metadata_variable_name,
             )
+            messages = self._get_messages_for_pre_call_check(model, kwargs)
             deployment = self.get_available_deployment(
                 model=model,
-                messages=kwargs.get("messages", None),
+                messages=messages,
                 specific_deployment=kwargs.pop("specific_deployment", None),
                 request_kwargs=kwargs,
             )
@@ -5041,6 +5085,8 @@ class Router:
                 client: Optional[Any] = None,
                 **kwargs,
             ):
+                if call_type == "responses":
+                    kwargs["_responses_api_pre_call_check"] = True
                 return self._generic_api_call_with_fallbacks(
                     original_function=original_function, **kwargs
                 )
@@ -5157,6 +5203,8 @@ class Router:
                 "acreate_interaction",
                 "create_interaction",
             ):
+                if call_type == "aresponses":
+                    kwargs["_responses_api_pre_call_check"] = True
                 return await self._ageneric_api_call_with_fallbacks(
                     original_function=original_function,
                     **kwargs,
