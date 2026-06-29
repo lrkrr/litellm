@@ -182,6 +182,45 @@ def test_thought_signature_removal_with_multiple_tool_calls():
     assert processed_messages[3]["tool_call_id"] == "call_2"
 
 
+def test_thought_signature_removal_for_non_gemini_responses_api():
+    """
+    Test that thought signatures are removed from call_id on function_call items
+    in mixed Responses API input (user message first) when sending to non-Gemini models.
+    """
+    rules_obj = Rules()
+
+    input_items = [
+        {"type": "message", "role": "user", "content": "What's the weather?"},
+        {
+            "type": "function_call",
+            "call_id": f"call_123{THOUGHT_SIGNATURE_SEPARATOR}sig1",
+            "name": "get_weather",
+            "arguments": '{"location": "SF"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": f"call_123{THOUGHT_SIGNATURE_SEPARATOR}sig1",
+            "output": "Sunny, 72°F",
+        },
+    ]
+
+    _, kwargs = function_setup(
+        original_function="aresponses",
+        rules_obj=rules_obj,
+        start_time=datetime.now(),
+        model="anthropic.claude-3-sonnet",
+        input=input_items,
+        litellm_call_id=str(uuid.uuid4()),
+        custom_llm_provider="bedrock",
+    )
+
+    processed_input = kwargs["input"]
+    assert processed_input[1]["call_id"] == "call_123"
+    assert processed_input[2]["call_id"] == "call_123"
+    assert THOUGHT_SIGNATURE_SEPARATOR not in processed_input[1]["call_id"]
+    assert THOUGHT_SIGNATURE_SEPARATOR not in processed_input[2]["call_id"]
+
+
 def test_messages_without_tool_calls_unchanged():
     """
     Test that messages without tool calls pass through unchanged

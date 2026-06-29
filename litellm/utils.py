@@ -753,6 +753,34 @@ def _remove_thought_signatures_from_messages(
     return processed_messages
 
 
+def _remove_thought_signatures_from_responses_input(
+    input_items: List, thought_signature_separator: str
+) -> List:
+    """
+    Remove thought signatures from call_id fields in Responses API input items.
+    """
+    processed_items = []
+
+    for item in input_items:
+        if hasattr(item, "model_dump"):
+            item_dict = item.model_dump()
+        elif isinstance(item, dict):
+            item_dict = item.copy()
+        else:
+            processed_items.append(item)
+            continue
+
+        call_id = item_dict.get("call_id")
+        if isinstance(call_id, str) and thought_signature_separator in call_id:
+            item_dict["call_id"] = _remove_thought_signature_from_id(
+                call_id, thought_signature_separator
+            )
+
+        processed_items.append(item_dict)
+
+    return processed_items
+
+
 def function_setup(  # noqa: PLR0915
     original_function: str, rules_obj, start_time, *args, **kwargs
 ):  # just run once to check if user wants to send their data anywhere - PostHog/Sentry/Slack/etc.
@@ -1069,12 +1097,61 @@ def function_setup(  # noqa: PLR0915
             or call_type == CallTypes.responses.value
         ):
             # Handle both 'input' (standard Responses API) and 'messages' (Cursor chat format)
-            messages = (
+            input_data = (
                 args[0]
                 if len(args) > 0
                 else kwargs.get("input")
                 or kwargs.get("messages", "default-message-value")
             )
+            messages = input_data
+
+            # Remove thought signatures from tool call IDs for non-Gemini models
+            if isinstance(input_data, list) and len(input_data) > 0:
+                try:
+                    from litellm.litellm_core_utils.get_llm_provider_logic import (
+                        get_llm_provider,
+                    )
+                    from litellm.litellm_core_utils.prompt_templates.factory import (
+                        THOUGHT_SIGNATURE_SEPARATOR,
+                    )
+
+                    target_model = kwargs.get("model") or (
+                        args[1] if len(args) > 1 else None
+                    )
+                    custom_llm_provider = kwargs.get("custom_llm_provider")
+
+                    if not custom_llm_provider and target_model:
+                        try:
+                            _, custom_llm_provider, _, _ = get_llm_provider(
+                                model=target_model,
+                                custom_llm_provider=custom_llm_provider,
+                            )
+                        except Exception:
+                            pass
+
+                    if not _is_gemini_model(target_model, custom_llm_provider):
+                        processed_input = (
+                            _remove_thought_signatures_from_responses_input(
+                                input_data, THOUGHT_SIGNATURE_SEPARATOR
+                            )
+                        )
+
+                        # Feed back processed input
+                        if "input" in kwargs:
+                            kwargs["input"] = processed_input
+                        elif "messages" in kwargs:
+                            kwargs["messages"] = processed_input
+                        elif len(args) > 0:
+                            args_list = list(args)
+                            args_list[0] = processed_input
+                            args = tuple(args_list)
+
+                        messages = processed_input
+
+                except Exception as e:
+                    verbose_logger.warning(
+                        f"Error removing thought signatures from tool call IDs: {str(e)}"
+                    )
         elif (
             call_type == CallTypes.generate_content.value
             or call_type == CallTypes.agenerate_content.value
