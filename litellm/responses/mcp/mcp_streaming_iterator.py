@@ -273,9 +273,9 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
         self.finished = False
 
         # Event queues and generation flags
-        self.mcp_discovery_events: List[
-            ResponsesAPIStreamingResponse
-        ] = mcp_events  # Pre-generated MCP discovery events
+        self.mcp_discovery_events: List[ResponsesAPIStreamingResponse] = (
+            mcp_events  # Pre-generated MCP discovery events
+        )
         self.tool_execution_events: List[ResponsesAPIStreamingResponse] = []
         self.mcp_discovery_generated = True  # Events are already generated
         self.mcp_events = (
@@ -284,9 +284,9 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
         self.tool_server_map = tool_server_map
 
         # Iterator references
-        self.base_iterator: Optional[
-            Union[Any, ResponsesAPIResponse]
-        ] = base_iterator  # Will be created when needed
+        self.base_iterator: Optional[Union[Any, ResponsesAPIResponse]] = (
+            base_iterator  # Will be created when needed
+        )
         self.follow_up_iterator: Optional[Any] = None
 
         # Response collection for tool execution
@@ -305,10 +305,10 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
 
         # Mark as async iterator
         self.is_async = True
-        
+
         # Track if we've emitted initial OpenAI lifecycle events
         self.initial_events_emitted = False
-        
+
         # Cache the response ID to ensure consistency across all events
         self._cached_response_id: Optional[str] = None
 
@@ -489,7 +489,9 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
                         response_obj = getattr(chunk, "response", None)
                         if response_obj and hasattr(response_obj, "id"):
                             self._cached_response_id = response_obj.id
-                            verbose_logger.debug(f"Cached response ID: {self._cached_response_id}")
+                            verbose_logger.debug(
+                                f"Cached response ID: {self._cached_response_id}"
+                            )
 
                     # After emitting response.output_item.added, transition to MCP discovery
                     if not self.initial_events_emitted and hasattr(chunk, "type"):
@@ -542,15 +544,17 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
         """
         if not self.base_iterator or not hasattr(self.base_iterator, "__anext__"):
             raise StopAsyncIteration
-            
+
         chunk = await cast(Any, self.base_iterator).__anext__()  # type: ignore[attr-defined]
 
         # Ensure response ID consistency - update chunk if needed
-        if self._cached_response_id and hasattr(chunk, 'response'):
-            response_obj = getattr(chunk, 'response', None)
-            if response_obj and hasattr(response_obj, 'id'):
+        if self._cached_response_id and hasattr(chunk, "response"):
+            response_obj = getattr(chunk, "response", None)
+            if response_obj and hasattr(response_obj, "id"):
                 if response_obj.id != self._cached_response_id:
-                    verbose_logger.debug(f"Updating response ID from {response_obj.id} to {self._cached_response_id}")
+                    verbose_logger.debug(
+                        f"Updating response ID from {response_obj.id} to {self._cached_response_id}"
+                    )
                     response_obj.id = self._cached_response_id
 
         # If auto-execution is enabled, check for completed responses
@@ -578,9 +582,9 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
             # Use the pre-fetched all_tools from original_request_params (no re-processing needed)
             params_for_llm = {}
             for key, value in params.items():
-                params_for_llm[
-                    key
-                ] = value  # Copy all params as-is since tools are already processed
+                params_for_llm[key] = (
+                    value  # Copy all params as-is since tools are already processed
+                )
 
             tools_count = (
                 len(params_for_llm.get("tools", []))

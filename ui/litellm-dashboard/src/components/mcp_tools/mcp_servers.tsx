@@ -9,6 +9,7 @@ import { useMCPServerHealth } from "../../app/(dashboard)/hooks/mcpServers/useMC
 import NotificationsManager from "../molecules/notifications_manager";
 import { deleteMCPServer } from "../networking";
 import { MCPSubmissionsTab } from "./MCPSubmissionsTab";
+import { MCPToolsetsTab } from "./MCPToolsetsTab";
 import { DataTable } from "../view_logs/table";
 import CreateMCPServer from "./create_mcp_server";
 import MCPConnect from "./mcp_connect";
@@ -19,6 +20,7 @@ import MCPSemanticFilterSettings from "../Settings/AdminSettings/MCPSemanticFilt
 import MCPNetworkSettings from "./MCPNetworkSettings";
 import MCPDiscovery from "./mcp_discovery";
 import { ByokCredentialModal } from "./ByokCredentialModal";
+import { getSecureItem } from "@/utils/secureStorage";
 
 const { Text: AntdText, Title: AntdTitle } = Typography;
 const EDIT_OAUTH_UI_STATE_KEY = "litellm-mcp-oauth-edit-state";
@@ -69,7 +71,7 @@ const MCPServers: React.FC<MCPServerProps> = ({ accessToken, userRole, userID })
       return;
     }
     try {
-      const stored = window.sessionStorage.getItem(EDIT_OAUTH_UI_STATE_KEY);
+      const stored = getSecureItem(EDIT_OAUTH_UI_STATE_KEY);
       if (!stored) {
         return;
       }
@@ -128,7 +130,13 @@ const MCPServers: React.FC<MCPServerProps> = ({ accessToken, userRole, userID })
         server.mcp_access_groups?.some((g: any) => (typeof g === "string" ? g === group : g && g.name === group)),
       );
     }
-    setFilteredServers(filtered);
+    const sorted = [...filtered].sort((a, b) => {
+      if (!a.created_at && !b.created_at) return 0;
+      if (!a.created_at) return 1;
+      if (!b.created_at) return -1;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+    setFilteredServers(sorted);
   }, [serversWithHealth]);
 
   // Handle team filter change
@@ -205,6 +213,7 @@ const MCPServers: React.FC<MCPServerProps> = ({ accessToken, userRole, userID })
   const handleCreateSuccess = (newMcpServer: MCPServer) => {
     setFilteredServers((prev) => [...prev, newMcpServer]);
     setModalVisible(false);
+    refetch();
   };
 
   // Memoize the selected server to prevent unnecessary re-renders
@@ -341,6 +350,7 @@ const MCPServers: React.FC<MCPServerProps> = ({ accessToken, userRole, userID })
         <TabList className="flex justify-between mt-2 w-full items-center">
           <div className="flex">
             <Tab>All Servers</Tab>
+            <Tab>Toolsets</Tab>
             <Tab>Connect</Tab>
             <Tab>Semantic Filter</Tab>
             <Tab>Network Settings</Tab>
@@ -418,6 +428,9 @@ const MCPServers: React.FC<MCPServerProps> = ({ accessToken, userRole, userID })
                 </div>
               </div>
             )}
+          </TabPanel>
+          <TabPanel>
+            <MCPToolsetsTab accessToken={accessToken} userRole={userRole} />
           </TabPanel>
           <TabPanel>
             <MCPConnect />

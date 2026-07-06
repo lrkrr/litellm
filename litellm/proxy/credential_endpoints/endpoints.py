@@ -21,11 +21,15 @@ router = APIRouter()
 
 class CredentialHelperUtils:
     @staticmethod
-    def encrypt_credential_values(credential: CredentialItem, new_encryption_key: Optional[str] = None) -> CredentialItem:
+    def encrypt_credential_values(
+        credential: CredentialItem, new_encryption_key: Optional[str] = None
+    ) -> CredentialItem:
         """Encrypt values in credential.credential_values and add to DB"""
         encrypted_credential_values = {}
         for key, value in (credential.credential_values or {}).items():
-            encrypted_credential_values[key] = encrypt_value_helper(value, new_encryption_key)
+            encrypted_credential_values[key] = encrypt_value_helper(
+                value, new_encryption_key
+            )
 
         # Return a new object to avoid mutating the caller's credential, which
         # is kept in memory and should remain unencrypted.
@@ -145,7 +149,9 @@ async def get_credentials(
 async def get_credential_by_name(
     request: Request,
     fastapi_response: Response,
-    credential_name: str = Path(..., description="The credential name, percent-decoded; may contain slashes"),
+    credential_name: str = Path(
+        ..., description="The credential name, percent-decoded; may contain slashes"
+    ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
@@ -223,7 +229,9 @@ async def get_credential_by_model(
 async def delete_credential(
     request: Request,
     fastapi_response: Response,
-    credential_name: str = Path(..., description="The credential name, percent-decoded; may contain slashes"),
+    credential_name: str = Path(
+        ..., description="The credential name, percent-decoded; may contain slashes"
+    ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
@@ -253,7 +261,9 @@ async def delete_credential(
 
 
 def update_db_credential(
-    db_credential: CredentialItem, updated_patch: CredentialItem, new_encryption_key: Optional[str] = None
+    db_credential: CredentialItem,
+    updated_patch: CredentialItem,
+    new_encryption_key: Optional[str] = None,
 ) -> CredentialItem:
     """
     Update a credential in the DB.
@@ -300,7 +310,9 @@ async def update_credential(
     request: Request,
     fastapi_response: Response,
     credential: CredentialItem,
-    credential_name: str = Path(..., description="The credential name, percent-decoded; may contain slashes"),
+    credential_name: str = Path(
+        ..., description="The credential name, percent-decoded; may contain slashes"
+    ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
@@ -328,6 +340,36 @@ async def update_credential(
                 "updated_by": user_api_key_dict.user_id,
             },
         )
+
+        # Sync in-memory credential_list (skip if not in memory - e.g., proxy restarted)
+        new_name = merged_credential.credential_name
+        existing_in_memory: Optional[CredentialItem] = None
+        for cred in litellm.credential_list:
+            if cred.credential_name == credential_name:
+                existing_in_memory = cred
+                break
+
+        if existing_in_memory is not None:
+            in_memory_values = dict(existing_in_memory.credential_values or {})
+            if credential.credential_values:
+                in_memory_values.update(credential.credential_values)
+            in_memory_info = dict(existing_in_memory.credential_info or {})
+            if credential.credential_info:
+                in_memory_info.update(credential.credential_info)
+            updated_in_memory = CredentialItem(
+                credential_name=new_name,
+                credential_values=in_memory_values,
+                credential_info=in_memory_info,
+            )
+            # Remove old entry if renamed, then use upsert_credentials to handle duplicates
+            if new_name != credential_name:
+                litellm.credential_list = [
+                    c
+                    for c in litellm.credential_list
+                    if c.credential_name != credential_name
+                ]
+            CredentialAccessor.upsert_credentials([updated_in_memory])
+
         return {"success": True, "message": "Credential updated successfully"}
     except Exception as e:
         return handle_exception_on_proxy(e)

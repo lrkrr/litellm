@@ -4,7 +4,18 @@ LiteLLM Proxy uses this MCP Client to connnect to other MCP servers.
 
 import asyncio
 import base64
-from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import httpx
 from mcp import ClientSession, ReadResourceResult, Resource, StdioServerParameters
@@ -14,7 +25,10 @@ from mcp.client.stdio import stdio_client
 streamable_http_client: Optional[Any] = None
 try:
     import mcp.client.streamable_http as streamable_http_module  # type: ignore
-    streamable_http_client = getattr(streamable_http_module, "streamable_http_client", None)
+
+    streamable_http_client = getattr(
+        streamable_http_module, "streamable_http_client", None
+    )
 except ImportError:
     pass
 from mcp.types import CallToolRequestParams as MCPCallToolRequestParams
@@ -68,6 +82,8 @@ class MCPSigV4Auth(httpx.Auth):
         aws_session_token: Optional[str] = None,
         aws_region_name: Optional[str] = None,
         aws_service_name: Optional[str] = None,
+        aws_role_name: Optional[str] = None,
+        aws_session_name: Optional[str] = None,
     ):
         try:
             from botocore.credentials import Credentials
@@ -83,7 +99,16 @@ class MCPSigV4Auth(httpx.Auth):
         # Note: os.environ/ prefixed values are already resolved by
         # ProxyConfig._check_for_os_environ_vars() at config load time.
         # Values arrive here as plain strings.
-        if aws_access_key_id and aws_secret_access_key:
+        if aws_role_name:
+            self.credentials = self._assume_role(
+                aws_role_name=aws_role_name,
+                aws_session_name=aws_session_name,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                aws_session_token=aws_session_token,
+                aws_region_name=self.region_name,
+            )
+        elif aws_access_key_id and aws_secret_access_key:
             self.credentials = Credentials(
                 access_key=aws_access_key_id,
                 secret_key=aws_secret_access_key,
@@ -101,6 +126,43 @@ class MCPSigV4Auth(httpx.Auth):
                     "aws_secret_access_key, or configure default credentials "
                     "(env vars, ~/.aws/credentials, instance profile)."
                 )
+
+    @staticmethod
+    def _assume_role(
+        aws_role_name: str,
+        aws_session_name: Optional[str],
+        aws_access_key_id: Optional[str],
+        aws_secret_access_key: Optional[str],
+        aws_session_token: Optional[str],
+        aws_region_name: str,
+    ):
+        """Call STS AssumeRole and return temporary credentials."""
+        import boto3
+        from botocore.credentials import Credentials
+
+        session_name = (
+            aws_session_name or f"litellm-mcp-{int(__import__('time').time())}"
+        )
+
+        sts_kwargs: dict = {"region_name": aws_region_name}
+        if aws_access_key_id and aws_secret_access_key:
+            sts_kwargs["aws_access_key_id"] = aws_access_key_id
+            sts_kwargs["aws_secret_access_key"] = aws_secret_access_key
+            if aws_session_token:
+                sts_kwargs["aws_session_token"] = aws_session_token
+
+        sts_client = boto3.client("sts", **sts_kwargs)
+        sts_response = sts_client.assume_role(
+            RoleArn=aws_role_name,
+            RoleSessionName=session_name,
+        )
+
+        sts_creds = sts_response["Credentials"]
+        return Credentials(
+            access_key=sts_creds["AccessKeyId"],
+            secret_key=sts_creds["SecretAccessKey"],
+            token=sts_creds["SessionToken"],
+        )
 
     def auth_flow(
         self, request: httpx.Request
@@ -159,6 +221,7 @@ class MCPClient:
         self.extra_headers: Optional[Dict[str, str]] = extra_headers
         self.ssl_verify: Optional[VerifyTypes] = ssl_verify
         self._aws_auth: Optional[httpx.Auth] = aws_auth
+        self._last_initialize_instructions: Optional[str] = None
         # handle the basic auth value if provided
         if auth_value:
             self.update_auth_value(auth_value)
@@ -188,12 +251,15 @@ class MCPClient:
         if self.transport_type == MCPTransport.sse:
             headers = self._get_auth_headers()
             httpx_client_factory = self._create_httpx_client_factory()
-            return sse_client(
-                url=self.server_url,
-                timeout=self.timeout,
-                headers=headers,
-                httpx_client_factory=httpx_client_factory,
-            ), None
+            return (
+                sse_client(
+                    url=self.server_url,
+                    timeout=self.timeout,
+                    headers=headers,
+                    httpx_client_factory=httpx_client_factory,
+                ),
+                None,
+            )
 
         # HTTP transport (default)
         if streamable_http_client is None:
@@ -201,12 +267,10 @@ class MCPClient:
                 "streamable_http_client is not available. "
                 "Please install mcp with HTTP support."
             )
-        
+
         headers = self._get_auth_headers()
         httpx_client_factory = self._create_httpx_client_factory()
-        verbose_logger.debug(
-            "litellm headers for streamable_http_client: %s", headers
-        )
+        verbose_logger.debug("litellm headers for streamable_http_client: %s", headers)
         http_client = httpx_client_factory(
             headers=headers,
             timeout=httpx.Timeout(self.timeout),
@@ -233,7 +297,12 @@ class MCPClient:
             session_ctx = ClientSession(read_stream, write_stream)
             session = await session_ctx.__aenter__()
             try:
-                await session.initialize()
+                init_result = await session.initialize()
+                self._last_initialize_instructions = None
+                if init_result is not None:
+                    ins = getattr(init_result, "instructions", None)
+                    if isinstance(ins, str) and ins.strip():
+                        self._last_initialize_instructions = ins.strip()
                 return await operation(session)
             finally:
                 try:
@@ -252,6 +321,7 @@ class MCPClient:
         """Open a session, run the provided coroutine, and clean up."""
         http_client: Optional[httpx.AsyncClient] = None
         try:
+            self._last_initialize_instructions = None
             transport_ctx, http_client = self._create_transport_context()
             return await self._execute_session_operation(transport_ctx, operation)
         except Exception:
@@ -392,7 +462,7 @@ class MCPClient:
     async def call_tool(
         self,
         call_tool_request_params: MCPCallToolRequestParams,
-        host_progress_callback: Optional[Callable] = None
+        host_progress_callback: Optional[Callable] = None,
     ) -> MCPCallToolResult:
         """
         Call an MCP Tool.
@@ -401,13 +471,15 @@ class MCPClient:
             f"MCP client calling tool '{call_tool_request_params.name}' with arguments: {call_tool_request_params.arguments}"
         )
 
-        async def on_progress(progress: float, total: float | None, message: str | None):
+        async def on_progress(
+            progress: float, total: float | None, message: str | None
+        ):
             percentage = (progress / total * 100) if total else 0
             verbose_logger.info(
                 f"MCP Tool '{call_tool_request_params.name}' progress: "
                 f"{progress}/{total} ({percentage:.0f}%) - {message or ''}"
             )
-            
+
             # Forward to Host if callback provided
             if host_progress_callback:
                 try:
@@ -421,8 +493,8 @@ class MCPClient:
                 name=call_tool_request_params.name,
                 arguments=call_tool_request_params.arguments,
                 progress_callback=on_progress,
-
             )
+
         try:
             tool_result = await self.run_with_session(_call_tool_operation)
             verbose_logger.info(

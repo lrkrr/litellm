@@ -28,12 +28,35 @@ from litellm.types.agents import (
     MakeAgentsPublicRequest,
     PatchAgentRequest,
 )
+from litellm.litellm_core_utils.litellm_logging import _get_masked_values
 from litellm.types.llms.custom_http import httpxSpecialProvider
 from litellm.types.proxy.management_endpoints.common_daily_activity import (
     SpendAnalyticsPaginatedResponse,
 )
 
 router = APIRouter()
+
+
+def _redact_sensitive_agent_fields(
+    agents: List[AgentResponse],
+) -> List[AgentResponse]:
+    """
+    Return copies of the given agents with sensitive configuration fields
+    redacted.  The original objects are not modified.
+    """
+    redacted: List[AgentResponse] = []
+    for agent in agents:
+        copy = agent.model_copy(deep=True)
+        copy.static_headers = None
+        copy.extra_headers = None
+        if copy.litellm_params:
+            copy.litellm_params = _get_masked_values(
+                copy.litellm_params,
+                unmasked_length=4,
+                number_of_asterisks=4,
+            )
+        redacted.append(copy)
+    return redacted
 
 
 def _check_agent_management_permission(user_api_key_dict: UserAPIKeyAuth) -> None:
@@ -182,6 +205,14 @@ async def get_agents(
                 and (agent.agent_id in litellm.public_agent_groups)
             )
 
+        # Redact sensitive fields for non-admin users
+        is_admin = (
+            user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+            or user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+        )
+        if not is_admin:
+            returned_agents = _redact_sensitive_agent_fields(returned_agents)
+
         if health_check:
             agents_with_url = [
                 agent
@@ -206,18 +237,18 @@ async def get_agents(
                     AGENT_HEALTH_CHECK_GATHER_TIMEOUT_SECONDS,
                 )
                 health_results = [
-                    {"agent_id": agent.agent_id, "healthy": False, "error": "Health check timed out"}
+                    {
+                        "agent_id": agent.agent_id,
+                        "healthy": False,
+                        "error": "Health check timed out",
+                    }
                     for agent in agents_with_url
                 ]
             healthy_ids = {
-                result["agent_id"]
-                for result in health_results
-                if result["healthy"]
+                result["agent_id"] for result in health_results if result["healthy"]
             }
             returned_agents = [
-                agent
-                for agent in agents_with_url
-                if agent.agent_id in healthy_ids
+                agent for agent in agents_with_url if agent.agent_id in healthy_ids
             ] + agents_without_url
 
         return returned_agents
@@ -236,8 +267,9 @@ async def get_agents(
 
 #### CRUD ENDPOINTS FOR AGENTS ####
 
-from litellm.proxy.agent_endpoints.agent_registry import \
-    global_agent_registry as AGENT_REGISTRY
+from litellm.proxy.agent_endpoints.agent_registry import (
+    global_agent_registry as AGENT_REGISTRY,
+)
 
 
 @router.post(
@@ -360,6 +392,24 @@ async def get_agent_by_id(
     """
     await check_feature_access_for_user(user_api_key_dict, "agents")
 
+    is_admin = (
+        user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+        or user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+    )
+    if not is_admin:
+        from litellm.proxy.agent_endpoints.auth.agent_permission_handler import (
+            AgentRequestHandler,
+        )
+
+        is_allowed = await AgentRequestHandler.is_agent_allowed(
+            agent_id=agent_id, user_api_key_auth=user_api_key_dict
+        )
+        if not is_allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Agent '{agent_id}' is not allowed for your key/team. Contact proxy admin for access.",
+            )
+
     from litellm.proxy.proxy_server import prisma_client
 
     if prisma_client is None:
@@ -396,6 +446,14 @@ async def get_agent_by_id(
             raise HTTPException(
                 status_code=404, detail=f"Agent with ID {agent_id} not found"
             )
+
+        # Redact sensitive fields for non-admin users
+        is_admin = (
+            user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+            or user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+        )
+        if not is_admin:
+            agent = _redact_sensitive_agent_fields([agent])[0]
 
         return agent
     except HTTPException:
@@ -698,8 +756,9 @@ async def make_agent_public(
     try:
         # Update the public model groups
         import litellm
-        from litellm.proxy.agent_endpoints.agent_registry import \
-            global_agent_registry as AGENT_REGISTRY
+        from litellm.proxy.agent_endpoints.agent_registry import (
+            global_agent_registry as AGENT_REGISTRY,
+        )
         from litellm.proxy.proxy_server import proxy_config
 
         # Check if user has admin permissions
@@ -814,8 +873,9 @@ async def make_agents_public(
     try:
         # Update the public model groups
         import litellm
-        from litellm.proxy.agent_endpoints.agent_registry import \
-            global_agent_registry as AGENT_REGISTRY
+        from litellm.proxy.agent_endpoints.agent_registry import (
+            global_agent_registry as AGENT_REGISTRY,
+        )
         from litellm.proxy.proxy_server import proxy_config
 
         # Load existing config

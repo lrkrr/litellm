@@ -4,7 +4,7 @@ organizations, teams, and keys.
 """
 
 import json
-from typing import Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 from fastapi import HTTPException, status
 
@@ -12,7 +12,12 @@ from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy.utils import PrismaClient
-        
+
+if TYPE_CHECKING:
+    from litellm.proxy._types import (
+        LiteLLM_ObjectPermissionTable,
+        LiteLLM_TeamTableCachedObj,
+    )
 
 
 async def attach_object_permission_to_dict(
@@ -21,30 +26,32 @@ async def attach_object_permission_to_dict(
 ) -> Dict:
     """
     Helper method to attach object_permission to a dictionary if object_permission_id is set.
-    
+
     This function:
     1. Checks if the dictionary has an object_permission_id
     2. If found, queries the database for the corresponding object permission
     3. Converts the object permission to a dictionary format
     4. Attaches it to the input dictionary under the 'object_permission' key
-    
+
     Args:
         data_dict: The dictionary to attach object_permission to
         prisma_client: The database client
-        
+
     Returns:
         Dict: The input dictionary with object_permission attached if found
-        
+
     Raises:
         ValueError: If prisma_client is None
     """
     if prisma_client is None:
         raise ValueError("Prisma client not found")
-        
+
     object_permission_id = data_dict.get("object_permission_id")
     if object_permission_id:
-        object_permission = await prisma_client.db.litellm_objectpermissiontable.find_unique(
-            where={"object_permission_id": object_permission_id},
+        object_permission = (
+            await prisma_client.db.litellm_objectpermissiontable.find_unique(
+                where={"object_permission_id": object_permission_id},
+            )
         )
         if object_permission:
             # Convert to dict if needed
@@ -162,21 +169,24 @@ async def _set_object_permission(
     if not isinstance(permission_data, dict):
         data_json.pop("object_permission")
         return data_json
-    
+
     # Clean data: exclude None values and object_permission_id
     clean_data = {
-        k: v for k, v in permission_data.items()
+        k: v
+        for k, v in permission_data.items()
         if v is not None and k != "object_permission_id"
     }
-    
+
     # Serialize mcp_tool_permissions to JSON string for GraphQL compatibility
     if "mcp_tool_permissions" in clean_data:
-        clean_data["mcp_tool_permissions"] = safe_dumps(clean_data["mcp_tool_permissions"])
-    
+        clean_data["mcp_tool_permissions"] = safe_dumps(
+            clean_data["mcp_tool_permissions"]
+        )
+
     created_permission = await prisma_client.db.litellm_objectpermissiontable.create(
         data=clean_data
     )
-    
+
     data_json["object_permission_id"] = created_permission.object_permission_id
     data_json.pop("object_permission")
     return data_json
@@ -276,6 +286,19 @@ def _extract_requested_mcp_access_groups(
     return set()
 
 
+def _extract_requested_mcp_toolsets(
+    object_permission: Optional[dict],
+) -> Set[str]:
+    """Extract MCP toolset IDs from a key's object_permission dict."""
+    if not object_permission or not isinstance(object_permission, dict):
+        return set()
+
+    toolsets = object_permission.get("mcp_toolsets")
+    if isinstance(toolsets, list):
+        return set(toolsets)
+    return set()
+
+
 async def validate_key_mcp_servers_against_team(
     object_permission: Optional[dict],
     team_obj: Optional["LiteLLM_TeamTableCachedObj"],
@@ -295,8 +318,10 @@ async def validate_key_mcp_servers_against_team(
     requested_servers = _extract_requested_mcp_server_ids(object_permission)
     requested_access_groups = _extract_requested_mcp_access_groups(object_permission)
 
+    requested_toolsets = _extract_requested_mcp_toolsets(object_permission)
+
     # Nothing to validate
-    if not requested_servers and not requested_access_groups:
+    if not requested_servers and not requested_access_groups and not requested_toolsets:
         return
 
     allow_all_keys_servers = _get_allow_all_keys_server_ids()
@@ -354,3 +379,24 @@ async def validate_key_mcp_servers_against_team(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": detail},
             )
+
+    # Validate requested toolsets against team's allowed toolsets.
+    # Only enforce the team-based restriction when a team is present — standalone
+    # keys (no team) can freely be granted any toolset by an admin.
+    if requested_toolsets and team_obj is not None:
+        team_op = team_obj.object_permission
+        team_mcp_toolsets = team_op.mcp_toolsets if team_op is not None else None
+        # None or [] means the team has no toolset restriction — allow any toolsets.
+        if team_mcp_toolsets:
+            disallowed_toolsets = requested_toolsets - set(team_mcp_toolsets)
+            if disallowed_toolsets:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": (
+                            f"Key requests MCP toolsets not allowed by team '{team_obj.team_id}': "
+                            f"{sorted(disallowed_toolsets)}. "
+                            f"Team allows: {sorted(team_mcp_toolsets)}."
+                        )
+                    },
+                )

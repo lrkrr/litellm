@@ -55,7 +55,7 @@ from openai.types.responses.response import (
 
 # Handle OpenAI SDK version compatibility for Text type
 try:
-    from openai.types.responses.response_create_params import ( Text as ResponseText ) # type: ignore[attr-defined] # fmt: skip # isort: skip
+    from openai.types.responses.response_create_params import Text as ResponseText  # type: ignore[attr-defined] # fmt: skip # isort: skip
 except (ImportError, AttributeError):
     # Fall back to the concrete config type available in all SDK versions
     from openai.types.responses.response_text_config_param import (
@@ -84,6 +84,7 @@ from typing_extensions import Annotated, Dict, Required, TypedDict, override
 from litellm.types.llms.base import BaseLiteLLMOpenAIResponseObject
 from litellm.types.responses.main import (
     GenericResponseOutputItem,
+    OutputCodeInterpreterCall,
     OutputFunctionToolCall,
     OutputImageGenerationCall,
 )
@@ -287,6 +288,7 @@ OpenAIFilesPurpose = Literal[
     "fine-tune-results",
     "vision",
     "user_data",
+    "messages",
 ]
 
 
@@ -313,11 +315,11 @@ class OpenAIFileObject(BaseModel):
     `fine-tune`, `fine-tune-results`, `vision`, and `user_data`.
     """
 
-    status: Optional[Literal["uploaded", "processed", "error"]] = None
+    status: Optional[Literal["uploaded", "processed", "error", "pending"]] = None
     """Deprecated.
 
-    The current status of the file, which can be either `uploaded`, `processed`, or
-    `error`.
+    The current status of the file, which can be either `uploaded`, `processed`,
+    `error`, or `pending` (Azure may return `pending` immediately after upload).
     """
 
     expires_at: Optional[int] = None
@@ -352,7 +354,7 @@ class OpenAIFileObject(BaseModel):
             return self.dict()
 
 
-CREATE_FILE_REQUESTS_PURPOSE = Literal["assistants", "batch", "fine-tune"]
+CREATE_FILE_REQUESTS_PURPOSE = Literal["assistants", "batch", "fine-tune", "messages"]
 
 
 # File expiration policy
@@ -373,11 +375,11 @@ class FileExpiresAfter(TypedDict):
 class CreateFileRequest(TypedDict, total=False):
     """
     CreateFileRequest
-    Used by Assistants API, Batches API, and Fine-Tunes API
+    Used by Assistants API, Batches API, Fine-Tunes API, and Anthropic Files API
 
     Required Params:
         file: FileTypes
-        purpose: Literal['assistants', 'batch', 'fine-tune']
+        purpose: Literal['assistants', 'batch', 'fine-tune', 'messages']
 
     Optional Params:
         expires_after: Optional[FileExpiresAfter] - The expiration policy for a file
@@ -534,6 +536,20 @@ class ChatCompletionRedactedThinkingBlock(TypedDict, total=False):
     cache_control: Optional[Union[dict, ChatCompletionCachedContent]]
 
 
+class ChatCompletionReasoningSummaryTextBlock(TypedDict, total=False):
+    type: Required[Literal["summary_text"]]
+    text: str
+
+
+class ChatCompletionReasoningItem(TypedDict, total=False):
+    """Represents an OpenAI Responses API reasoning item for round-tripping in conversation history."""
+
+    type: Required[Literal["reasoning"]]
+    id: str
+    encrypted_content: Optional[str]
+    summary: List["ChatCompletionReasoningSummaryTextBlock"]
+
+
 class WebSearchOptionsUserLocationApproximate(TypedDict, total=False):
     city: str
     """Free text input for the city of the user, e.g. `San Francisco`."""
@@ -663,7 +679,9 @@ class ChatCompletionFileObjectFile(TypedDict, total=False):
     filename: str
     format: str
     detail: str  # For video/image resolution control (low, medium, high, ultra_high)
-    video_metadata: Dict[str, Any]  # For video-specific metadata (fps, start_offset, end_offset)
+    video_metadata: Dict[
+        str, Any
+    ]  # For video-specific metadata (fps, start_offset, end_offset)
 
 
 class ChatCompletionFileObject(TypedDict):
@@ -729,6 +747,7 @@ class ChatCompletionAssistantMessage(OpenAIChatCompletionAssistantMessage, total
     thinking_blocks: Optional[
         List[Union[ChatCompletionThinkingBlock, ChatCompletionRedactedThinkingBlock]]
     ]
+    reasoning_items: Optional[List[ChatCompletionReasoningItem]]
 
 
 class ChatCompletionToolMessage(TypedDict):
@@ -767,6 +786,7 @@ class ChatCompletionDeveloperMessage(OpenAIChatCompletionDeveloperMessage, total
 class GenericChatCompletionMessage(TypedDict, total=False):
     role: Required[str]
     content: Required[Union[str, List]]
+    cache_control: ChatCompletionCachedContent
 
 
 ValidUserMessageContentTypes = [
@@ -972,10 +992,8 @@ class Hyperparameters(BaseModel):
     n_epochs: Optional[Union[str, int]] = (
         None  # "The number of epochs to train the model for"
     )
-    
-    model_config = {
-        "extra": "allow"
-    }
+
+    model_config = {"extra": "allow"}
 
 
 class FineTuningJobCreate(BaseModel):
@@ -1051,13 +1069,20 @@ OpenAIImageGenerationOptionalParams = Literal[
     "size",
     "style",
     "user",
+    "seed",
+    "safety_tolerance",
+    "prompt_upsampling",
+    "raw",
+    "num_images",
+    "image_url",
+    "image_prompt_strength",
+    "aspect_ratio",
 ]
 
 OpenAIImageEditOptionalParams = Literal[
     "background",
     "n",
-    "mask"
-    "output_compression",
+    "mask" "output_compression",
     "output_format",
     "quality",
     "partial_images",
@@ -1066,6 +1091,7 @@ OpenAIImageEditOptionalParams = Literal[
     "style",
     "user",
 ]
+
 
 class ComputerToolParam(TypedDict, total=False):
     display_height: Required[float]
@@ -1199,6 +1225,14 @@ class ResponseAPIUsage(BaseLiteLLMOpenAIResponseObject):
     cost: Optional[float] = None
     """The cost of the request."""
 
+    @field_validator("cost", mode="before")
+    @classmethod
+    def parse_cost(cls, v: Any) -> Optional[float]:
+        """Normalise cost: accept either a float or a dict with a ``total_cost`` key."""
+        if isinstance(v, dict):
+            return v.get("total_cost")
+        return v
+
     model_config = {"extra": "allow"}
 
 
@@ -1225,6 +1259,7 @@ class ResponsesAPIResponse(BaseLiteLLMOpenAIResponseObject):
         List[
             Union[
                 GenericResponseOutputItem,
+                OutputCodeInterpreterCall,
                 OutputFunctionToolCall,
                 OutputImageGenerationCall,
                 ResponseFunctionToolCall,
@@ -1291,14 +1326,16 @@ class ResponsesAPIResponse(BaseLiteLLMOpenAIResponseObject):
         if not isinstance(serialized, list):
             return serialized
         return [
-            {
-                k: v
-                for k, v in item.items()
-                if v is not None
-                or k not in ("status", "content", "encrypted_content")
-            }
-            if isinstance(item, dict) and item.get("type") == "reasoning"
-            else item
+            (
+                {
+                    k: v
+                    for k, v in item.items()
+                    if v is not None
+                    or k not in ("status", "content", "encrypted_content")
+                }
+                if isinstance(item, dict) and item.get("type") == "reasoning"
+                else item
+            )
             for item in serialized
         ]
 
@@ -2110,7 +2147,15 @@ class OpenAIBatchResult(TypedDict, total=False):
 
 
 OpenAIChatCompletionFinishReason = Literal[
-    "stop", "content_filter", "function_call", "tool_calls", "length", "guardrail_intervened", "eos", "finish_reason_unspecified", "malformed_function_call" # last 2 are vertex ai specific, guardrail_intervened is bedrock specific
+    "stop",
+    "content_filter",
+    "function_call",
+    "tool_calls",
+    "length",
+    "guardrail_intervened",
+    "eos",
+    "finish_reason_unspecified",
+    "malformed_function_call",  # last 2 are vertex ai specific, guardrail_intervened is bedrock specific
 ]
 
 
@@ -2163,6 +2208,7 @@ class CreateVideoRequest(TypedDict, total=False):
         model: Optional[str] - The video generation model to use (defaults to sora-2)
         seconds: Optional[str] - Clip duration in seconds (defaults to 4 seconds)
         size: Optional[str] - Output resolution formatted as width x height (defaults to 720x1280)
+        characters: Optional[List[Dict[str, str]]] - Character references to include in generation
         user: Optional[str] - A unique identifier representing your end-user
         extra_headers: Optional[Dict[str, str]] - Additional headers
         extra_body: Optional[Dict[str, str]] - Additional body parameters
@@ -2174,6 +2220,7 @@ class CreateVideoRequest(TypedDict, total=False):
     model: Optional[str]
     seconds: Optional[str]
     size: Optional[str]
+    characters: Optional[List[Dict[str, str]]]
     user: Optional[str]
     extra_headers: Optional[Dict[str, str]]
     extra_body: Optional[Dict[str, str]]

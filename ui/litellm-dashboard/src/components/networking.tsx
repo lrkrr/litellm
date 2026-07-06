@@ -68,8 +68,8 @@ export const getInProductNudgesCall = async (accessToken: string) => {
 /**
  * Helper file for calls being made to proxy
  */
-import { message } from "antd";
-import { clearTokenCookies } from "@/utils/cookieUtils";
+import MessageManager from "@/components/molecules/message_manager";
+import { clearTokenCookies, storeLoginToken } from "@/utils/cookieUtils";
 import { TagNewRequest, TagUpdateRequest, TagListResponse, TagInfoResponse } from "./tag_management/types";
 import { Team } from "./key_team_helpers/key_list";
 import { UserInfo } from "./view_users/types";
@@ -81,12 +81,30 @@ const isLocal = process.env.NODE_ENV === "development";
 // In dev, if NEXT_PUBLIC_USE_REWRITES=true the Next.js dev server proxies API calls
 // to the backend — use relative URLs (null) so rewrites can intercept them.
 const defaultProxyBaseUrl =
-  isLocal && process.env.NEXT_PUBLIC_USE_REWRITES !== "true"
+  process.env.NEXT_PUBLIC_BASE_URL
+    ? process.env.NEXT_PUBLIC_BASE_URL
+    : isLocal && process.env.NEXT_PUBLIC_USE_REWRITES !== "true"
     ? "http://localhost:4000"
     : null;
 const defaultServerRootPath = "/";
 export let serverRootPath = defaultServerRootPath;
-export let proxyBaseUrl = defaultProxyBaseUrl;
+const WORKER_URL_KEY = "litellm_worker_url";
+// If a worker URL is in localStorage, use it as the initial proxyBaseUrl.
+// This survives page navigation and the sessionStorage.clear() in user_dashboard.
+const _rawWorkerUrl =
+  typeof window !== "undefined" ? window.localStorage.getItem(WORKER_URL_KEY) : null;
+// Validate stored worker URL — reject non-HTTP schemes to prevent exfiltration
+const _initialWorkerUrl = (() => {
+  if (!_rawWorkerUrl) return null;
+  try {
+    const parsed = new URL(_rawWorkerUrl);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return _rawWorkerUrl;
+  } catch { /* invalid URL */ }
+  // Invalid URL in storage — clear it
+  if (typeof window !== "undefined") window.localStorage.removeItem(WORKER_URL_KEY);
+  return null;
+})();
+export let proxyBaseUrl: string | null = _initialWorkerUrl ?? defaultProxyBaseUrl;
 if (isLocal != true) {
   console.log = function () { };
 }
@@ -102,11 +120,16 @@ const updateProxyBaseUrl = (serverRootPath: string, receivedProxyBaseUrl: string
   /**
    * Special function for updating the proxy base url. Should only be called by getUiConfig.
    */
+  // If a worker URL is in localStorage, don't let getUiConfig overwrite it
+  if (typeof window !== "undefined" && window.localStorage.getItem(WORKER_URL_KEY)) {
+    return;
+  }
   const browserLocation = getWindowLocation();
-  const resolvedDefaultProxyBaseUrl =
-    isLocal && process.env.NEXT_PUBLIC_USE_REWRITES !== "true"
-      ? "http://localhost:4000"
-      : browserLocation?.origin ?? null;
+  const resolvedDefaultProxyBaseUrl = process.env.NEXT_PUBLIC_BASE_URL
+    ? process.env.NEXT_PUBLIC_BASE_URL
+    : isLocal && process.env.NEXT_PUBLIC_USE_REWRITES !== "true"
+    ? "http://localhost:4000"
+    : browserLocation?.origin ?? null;
   let initialProxyBaseUrl = receivedProxyBaseUrl || resolvedDefaultProxyBaseUrl;
   console.log("proxyBaseUrl:", proxyBaseUrl);
   console.log("serverRootPath:", serverRootPath);
@@ -137,6 +160,36 @@ export const getProxyBaseUrl = (): string => {
   return browserLocation?.origin ?? "";
 };
 
+/**
+ * Switch API calls to point at a worker (or back to the control plane).
+ * Persists to localStorage so it survives page navigation and the
+ * sessionStorage.clear() in user_dashboard. Also updates the module-level
+ * proxyBaseUrl so in-flight code in this JS execution sees the new value
+ * immediately.
+ */
+function isValidHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export function switchToWorkerUrl(workerUrl: string | null): void {
+  if (workerUrl && !isValidHttpUrl(workerUrl)) {
+    return;
+  }
+  if (typeof window !== "undefined") {
+    if (workerUrl) {
+      window.localStorage.setItem(WORKER_URL_KEY, workerUrl);
+    } else {
+      window.localStorage.removeItem(WORKER_URL_KEY);
+    }
+  }
+  proxyBaseUrl = workerUrl ?? defaultProxyBaseUrl;
+}
+
 const HTTP_REQUEST = {
   GET: "GET",
   POST: "POST",
@@ -152,6 +205,7 @@ export interface Model {
 
 interface PromptInfo {
   prompt_type: string;
+  environment?: string;
 }
 
 export interface PromptSpec {
@@ -161,6 +215,8 @@ export interface PromptSpec {
   created_at?: string;
   updated_at?: string;
   version?: number; // Explicit version number for version history
+  environment?: string;
+  created_by?: string;
 }
 
 export interface PromptTemplateBase {
@@ -172,6 +228,7 @@ export interface PromptTemplateBase {
 interface PromptInfoResponse {
   prompt_spec: PromptSpec;
   raw_prompt_template: PromptTemplateBase | null;
+  environments?: string[];
 }
 
 export interface ListPromptsResponse {
@@ -262,12 +319,20 @@ interface PublicModelHubInfo {
   useful_links: Record<string, string | { url: string; index: number }>;
 }
 
+export interface WorkerInfo {
+  worker_id: string;
+  name: string;
+  url: string;
+}
+
 export interface LiteLLMWellKnownUiConfig {
   server_root_path: string;
   proxy_base_url: string | null;
   auto_redirect_to_sso: boolean;
   admin_ui_disabled: boolean;
   sso_configured: boolean;
+  is_control_plane?: boolean;
+  workers?: WorkerInfo[];
 }
 
 export interface CredentialsResponse {
@@ -555,7 +620,7 @@ export const modelCreateCall = async (accessToken: string, formValues: Model) =>
     console.log("API Response:", data);
 
     // Close any existing messages before showing new ones
-    message.destroy();
+    MessageManager.destroy();
 
     // Sequential success messages
     NotificationsManager.success(`Model ${formValues.model_name} created successfully`);
@@ -907,6 +972,7 @@ export const keyCreateForAgentCall = async (
   keyAlias: string,
   models: string[],
   metadata?: Record<string, any>,
+  teamId?: string | null,
 ) => {
   const url = proxyBaseUrl ? `${proxyBaseUrl}/key/generate` : `/key/generate`;
   const body: Record<string, any> = {
@@ -914,6 +980,9 @@ export const keyCreateForAgentCall = async (
     key_alias: keyAlias,
     models: models.length > 0 ? models : [],
   };
+  if (teamId) {
+    body.team_id = teamId;
+  }
   if (metadata && Object.keys(metadata).length > 0) {
     body.metadata = metadata;
   }
@@ -1195,6 +1264,65 @@ export const userListCall = async (
     // Handle success - you might want to update some state or UI based on the created key
   } catch (error) {
     console.error("Failed to create key:", error);
+    throw error;
+  }
+};
+
+/**
+ * Response type for /v2/user/info — lightweight endpoint that returns only the user object.
+ */
+export interface UserInfoV2Response {
+  user_id: string;
+  user_email: string | null;
+  user_alias: string | null;
+  user_role: string | null;
+  spend: number;
+  max_budget: number | null;
+  models: string[];
+  budget_duration: string | null;
+  budget_reset_at: string | null;
+  metadata: Record<string, any> | null;
+  created_at: string | null;
+  updated_at: string | null;
+  sso_user_id: string | null;
+  teams: string[];
+}
+
+/**
+ * Lightweight user info fetch from /v2/user/info.
+ * Returns only the user object — no keys, no teams objects.
+ *
+ * @param accessToken - Bearer token for auth
+ * @param userId - Optional user ID to look up. If omitted, returns the caller's own info.
+ */
+export const userGetInfoV2 = async (
+  accessToken: string,
+  userId?: string,
+): Promise<UserInfoV2Response> => {
+  try {
+    let url = proxyBaseUrl ? `${proxyBaseUrl}/v2/user/info` : `/v2/user/info`;
+    if (userId) {
+      url += `?user_id=${encodeURIComponent(userId)}`;
+    }
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = deriveErrorMessage(errorData);
+      handleError(errorMessage);
+      throw new Error(errorMessage);
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch user info v2:", error);
     throw error;
   }
 };
@@ -2149,6 +2277,19 @@ export const mcpHubPublicServersCall = async () => {
   if (!response.ok) {
     console.error(`mcpHubPublicServersCall failed with status ${response.status}`);
     return [];
+  }
+  return response.json();
+};
+
+export const skillHubPublicCall = async () => {
+  const url = proxyBaseUrl ? `${proxyBaseUrl}/public/skill_hub` : `/public/skill_hub`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!response.ok) {
+    console.error(`skillHubPublicCall failed with status ${response.status}`);
+    return { plugins: [] };
   }
   return response.json();
 };
@@ -3142,6 +3283,7 @@ export const keyAliasesCall = async (
   page: number = 1,
   size: number = 50,
   search?: string,
+  team_id?: string,
 ): Promise<PaginatedKeyAliasResponse> => {
   /**
    * Get key aliases from proxy with pagination and optional search
@@ -3152,6 +3294,7 @@ export const keyAliasesCall = async (
         page: String(page),
         size: String(size),
         ...(search ? { search } : {}),
+        ...(team_id ? { team_id } : {}),
       }),
     );
     let url = proxyBaseUrl ? `${proxyBaseUrl}/key/aliases` : `/key/aliases`;
@@ -3632,6 +3775,7 @@ export interface Member {
   max_budget_in_team?: number | null;
   tpm_limit?: number | null;
   rpm_limit?: number | null;
+  allowed_models?: string[] | null;
 }
 
 export const teamMemberAddCall = async (accessToken: string, teamId: string, formValues: Member) => {
@@ -3770,6 +3914,9 @@ export const teamMemberUpdateCall = async (
     }
     if (formValues.rpm_limit !== undefined && formValues.rpm_limit !== null) {
       requestBody.rpm_limit = formValues.rpm_limit;
+    }
+    if (formValues.allowed_models !== undefined) {
+      requestBody.allowed_models = formValues.allowed_models;
     }
 
     console.log("Final request body:", requestBody);
@@ -5914,9 +6061,15 @@ export const estimateAttachmentImpactCall = async (
   }
 };
 
-export const getPromptsList = async (accessToken: string): Promise<ListPromptsResponse> => {
+export const getPromptsList = async (
+  accessToken: string,
+  environment?: string,
+): Promise<ListPromptsResponse> => {
   try {
-    const url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/list` : `/prompts/list`;
+    let url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/list` : `/prompts/list`;
+    if (environment) {
+      url += `?environment=${encodeURIComponent(environment)}`;
+    }
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -5940,9 +6093,12 @@ export const getPromptsList = async (accessToken: string): Promise<ListPromptsRe
   }
 };
 
-export const getPromptInfo = async (accessToken: string, promptId: string): Promise<PromptInfoResponse> => {
+export const getPromptInfo = async (accessToken: string, promptId: string, environment?: string): Promise<PromptInfoResponse> => {
   try {
-    const url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/${promptId}/info` : `/prompts/${promptId}/info`;
+    let url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/${promptId}/info` : `/prompts/${promptId}/info`;
+    if (environment) {
+      url += `?environment=${encodeURIComponent(environment)}`;
+    }
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -5966,9 +6122,12 @@ export const getPromptInfo = async (accessToken: string, promptId: string): Prom
   }
 };
 
-export const getPromptVersions = async (accessToken: string, promptId: string): Promise<ListPromptsResponse> => {
+export const getPromptVersions = async (accessToken: string, promptId: string, environment?: string): Promise<ListPromptsResponse> => {
   try {
-    const url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/${promptId}/versions` : `/prompts/${promptId}/versions`;
+    let url = proxyBaseUrl ? `${proxyBaseUrl}/prompts/${promptId}/versions` : `/prompts/${promptId}/versions`;
+    if (environment) {
+      url += `?environment=${encodeURIComponent(environment)}`;
+    }
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -6532,6 +6691,99 @@ export const deleteMCPServer = async (accessToken: string, serverId: string) => 
     }
   } catch (error) {
     console.error("Failed to delete key:", error);
+    throw error;
+  }
+};
+
+export const fetchMCPToolsets = async (accessToken: string): Promise<any[]> => {
+  try {
+    const url = (proxyBaseUrl ? `${proxyBaseUrl}` : "") + `/v1/mcp/toolset`;
+    const response = await fetch(url, {
+      method: HTTP_REQUEST.GET,
+      headers: {
+        [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = deriveErrorMessage(errorData);
+      handleError(errorMessage);
+      throw new Error(errorMessage);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch MCP toolsets:", error);
+    throw error;
+  }
+};
+
+export const createMCPToolset = async (accessToken: string, formValues: Record<string, any>) => {
+  try {
+    const url = (proxyBaseUrl ? `${proxyBaseUrl}` : "") + `/v1/mcp/toolset`;
+    const response = await fetch(url, {
+      method: HTTP_REQUEST.POST,
+      headers: {
+        [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(formValues),
+    });
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = deriveErrorMessage(errorData);
+      handleError(errorMessage);
+      throw new Error(errorMessage);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to create MCP toolset:", error);
+    throw error;
+  }
+};
+
+export const updateMCPToolset = async (accessToken: string, formValues: Record<string, any>) => {
+  try {
+    const url = (proxyBaseUrl ? `${proxyBaseUrl}` : "") + `/v1/mcp/toolset`;
+    const response = await fetch(url, {
+      method: HTTP_REQUEST.PUT,
+      headers: {
+        [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(formValues),
+    });
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = deriveErrorMessage(errorData);
+      handleError(errorMessage);
+      throw new Error(errorMessage);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to update MCP toolset:", error);
+    throw error;
+  }
+};
+
+export const deleteMCPToolset = async (accessToken: string, toolsetId: string) => {
+  try {
+    const url = (proxyBaseUrl ? `${proxyBaseUrl}` : "") + `/v1/mcp/toolset/${toolsetId}`;
+    const response = await fetch(url, {
+      method: HTTP_REQUEST.DELETE,
+      headers: {
+        [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = deriveErrorMessage(errorData);
+      handleError(errorMessage);
+      throw new Error(errorMessage);
+    }
+  } catch (error) {
+    console.error("Failed to delete MCP toolset:", error);
     throw error;
   }
 };
@@ -7143,7 +7395,6 @@ export const updateDefaultTeamSettings = async (accessToken: string, settings: R
 
     const data = await response.json();
     console.log("Updated default team settings:", data);
-    NotificationsManager.success("Default team settings updated successfully");
     return data;
   } catch (error) {
     console.error("Failed to update default team settings:", error);
@@ -7168,12 +7419,11 @@ export const getTeamPermissionsCall = async (accessToken: string, teamId: string
     if (!response.ok) {
       const errorData = await response.json();
       const errorMessage = deriveErrorMessage(errorData);
-      handleError(errorMessage);
-      throw new Error(errorMessage);
+      console.error("Available permissions fetch failed:", errorMessage);
+      return { all_available_permissions: [], team_member_permissions: [] };
     }
 
     const data = await response.json();
-    console.log("Team permissions response:", data);
     return data;
   } catch (error) {
     console.error("Failed to get team permissions:", error);
@@ -8968,15 +9218,20 @@ export const deriveErrorMessage = (errorData: any): string => {
 export interface LoginRequest {
   username: string;
   password: string;
+  useV3?: boolean;
 }
 
 interface LoginResponse {
   redirect_url: string;
+  token?: string;
+  code?: string;
+  expires_in?: number;
 }
 
-export const loginCall = async (username: string, password: string): Promise<LoginResponse> => {
+export const loginCall = async (username: string, password: string, useV3?: boolean): Promise<LoginResponse> => {
   const proxyBaseUrl = getProxyBaseUrl();
-  const loginUrl = proxyBaseUrl ? `${proxyBaseUrl}/v2/login` : "/v2/login";
+  const loginPath = useV3 ? "/v3/login" : "/v2/login";
+  const loginUrl = proxyBaseUrl ? `${proxyBaseUrl}${loginPath}` : loginPath;
 
   const body = JSON.stringify({
     username,
@@ -8998,8 +9253,63 @@ export const loginCall = async (username: string, password: string): Promise<Log
     throw new Error(errorMessage);
   }
 
-  const data = await response.json();
+  const data: LoginResponse = await response.json();
+
+  // v3 returns an opaque code — exchange it for the real JWT
+  if (useV3 && data.code) {
+    const exchangeUrl = proxyBaseUrl
+      ? `${proxyBaseUrl}/v3/login/exchange`
+      : "/v3/login/exchange";
+
+    const exchangeResponse = await fetch(exchangeUrl, {
+      method: "POST",
+      body: JSON.stringify({ code: data.code }),
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!exchangeResponse.ok) {
+      const errorData = await exchangeResponse.json();
+      throw new Error(deriveErrorMessage(errorData));
+    }
+
+    const exchangeData: LoginResponse = await exchangeResponse.json();
+    if (exchangeData.token) {
+      storeLoginToken(exchangeData.token);
+    }
+    return exchangeData;
+  }
+
+  // Backwards compatibility: v2 or old v3 returns token directly
+  if (data.token) {
+    storeLoginToken(data.token);
+  }
+
   return data;
+};
+
+/**
+ * Exchange a single-use login code for a JWT token.
+ * Used by the SSO callback when the worker redirects back with ?code=.
+ */
+export const exchangeLoginCode = async (code: string, workerBaseUrl?: string | null): Promise<string> => {
+  const base = workerBaseUrl || getProxyBaseUrl();
+  const response = await fetch(`${base}/v3/login/exchange`, {
+    method: "POST",
+    body: JSON.stringify({ code }),
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  const data = await response.json();
+  if (data.token) {
+    document.cookie = `token=${data.token}; path=/; SameSite=Lax`;
+  }
+  return data.token;
 };
 
 export const getUiSettings = async () => {
@@ -9038,9 +9348,7 @@ export const updateUiSettings = async (accessToken: string, settings: Record<str
 };
 
 
-// ============================================================
 // Claude Code Marketplace Networking Functions
-// ============================================================
 
 /**
  * Get public marketplace catalog (no authentication required)
@@ -9386,7 +9694,7 @@ export interface ToolPolicyOption {
   description: string;
 }
 
-interface ToolPolicyOptionsResponse {
+export interface ToolPolicyOptionsResponse {
   input_policies: ToolPolicyOption[];
   output_policies: ToolPolicyOption[];
 }
@@ -9439,12 +9747,12 @@ export interface ToolPolicyOverrideRow {
   updated_at?: string;
 }
 
-interface ToolDetailResponse {
+export interface ToolDetailResponse {
   tool: ToolRow;
   overrides: ToolPolicyOverrideRow[];
 }
 
-interface ToolUsageLogEntry {
+export interface ToolUsageLogEntry {
   id: string;
   timestamp: string;
   model?: string | null;
@@ -9453,7 +9761,7 @@ interface ToolUsageLogEntry {
   input_snippet?: string | null;
 }
 
-interface ToolUsageLogsResponse {
+export interface ToolUsageLogsResponse {
   logs: ToolUsageLogEntry[];
   total: number;
   page: number;
@@ -9605,7 +9913,17 @@ export const storeMCPOAuthUserCredential = async (
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
-    throw new Error((err as { detail?: { error?: string } })?.detail?.error || "Failed to store OAuth credential");
+    const errObj = err as { detail?: unknown };
+    const detail = errObj?.detail;
+    const detailMsg =
+      Array.isArray(detail)
+        ? detail.map((d: unknown) => (d && typeof d === "object" ? (d as Record<string, unknown>).msg ?? JSON.stringify(d) : String(d))).join("; ")
+        : typeof detail === "string"
+          ? detail
+          : detail && typeof (detail as Record<string, unknown>).error === "string"
+            ? (detail as Record<string, unknown>).error as string
+            : undefined;
+    throw new Error(detailMsg || "Failed to store OAuth credential");
   }
   return response.json();
 };
@@ -9623,7 +9941,17 @@ export const deleteMCPOAuthUserCredential = async (
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
-    throw new Error((err as { detail?: { error?: string } })?.detail?.error || "Failed to revoke OAuth credential");
+    const errObj = err as { detail?: unknown };
+    const detail = errObj?.detail;
+    const detailMsg =
+      Array.isArray(detail)
+        ? detail.map((d: unknown) => (d && typeof d === "object" ? (d as Record<string, unknown>).msg ?? JSON.stringify(d) : String(d))).join("; ")
+        : typeof detail === "string"
+          ? detail
+          : detail && typeof (detail as Record<string, unknown>).error === "string"
+            ? (detail as Record<string, unknown>).error as string
+            : undefined;
+    throw new Error(detailMsg || "Failed to revoke OAuth credential");
   }
   return response.json();
 };
@@ -9657,4 +9985,148 @@ export const listMCPUserCredentials = async (
   });
   if (!response.ok) return [];
   return response.json();
+};
+
+// ============================================================
+// Memory management (/v1/memory)
+// ============================================================
+
+/**
+ * Encode a memory key for use in a URL path segment.
+ *
+ * The backend route is declared as `/v1/memory/{key:path}`, which supports
+ * slashes in the key (e.g. `user/123/notes`). Plain `encodeURIComponent`
+ * encodes `/` as `%2F`, and some proxies/middlewares (nginx default,
+ * CloudFlare, AWS ALB) either reject or silently re-decode `%2F`, which
+ * can break the request before FastAPI ever sees it.
+ *
+ * We keep slashes literal as path delimiters while still encoding every
+ * other potentially-unsafe character (spaces, `?`, `#`, `%`, etc.) per
+ * path segment.
+ */
+const encodeMemoryKeyForPath = (key: string): string =>
+  key.split("/").map(encodeURIComponent).join("/");
+
+export interface MemoryRow {
+  memory_id: string;
+  key: string;
+  value: string;
+  metadata?: unknown;
+  user_id?: string | null;
+  team_id?: string | null;
+  created_at?: string;
+  created_by?: string | null;
+  updated_at?: string;
+  updated_by?: string | null;
+}
+
+export interface MemoryListResponse {
+  memories: MemoryRow[];
+  total: number;
+}
+
+export const fetchMemoryList = async (
+  accessToken: string,
+  options: {
+    key?: string;
+    keyPrefix?: string;
+    page?: number;
+    pageSize?: number;
+  } = {},
+): Promise<MemoryListResponse> => {
+  const base = proxyBaseUrl ? `${proxyBaseUrl}/v1/memory` : `/v1/memory`;
+  const params = new URLSearchParams();
+  // keyPrefix takes precedence — backend also does, but we omit `key`
+  // to keep the URL clean and intent obvious.
+  if (options.keyPrefix) {
+    params.append("key_prefix", options.keyPrefix);
+  } else if (options.key) {
+    params.append("key", options.key);
+  }
+  if (options.page != null) params.append("page", String(options.page));
+  if (options.pageSize != null)
+    params.append("page_size", String(options.pageSize));
+  const url = params.toString() ? `${base}?${params.toString()}` : base;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(errorData);
+  }
+  return response.json();
+};
+
+export const createMemory = async (
+  accessToken: string,
+  payload: { key: string; value: string; metadata?: unknown },
+): Promise<MemoryRow> => {
+  const url = proxyBaseUrl ? `${proxyBaseUrl}/v1/memory` : `/v1/memory`;
+  const body: Record<string, unknown> = {
+    key: payload.key,
+    value: payload.value,
+  };
+  if (payload.metadata !== undefined) body.metadata = payload.metadata;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(errorData);
+  }
+  return response.json();
+};
+
+export const updateMemory = async (
+  accessToken: string,
+  key: string,
+  payload: { value?: string; metadata?: unknown },
+): Promise<MemoryRow> => {
+  const encoded = encodeMemoryKeyForPath(key);
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/v1/memory/${encoded}`
+    : `/v1/memory/${encoded}`;
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(errorData);
+  }
+  return response.json();
+};
+
+export const deleteMemory = async (
+  accessToken: string,
+  key: string,
+): Promise<void> => {
+  const encoded = encodeMemoryKeyForPath(key);
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/v1/memory/${encoded}`
+    : `/v1/memory/${encoded}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(errorData);
+  }
 };

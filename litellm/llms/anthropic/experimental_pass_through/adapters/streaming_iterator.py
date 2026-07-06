@@ -129,14 +129,22 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if should_start_new_block and not self.sent_content_block_finish:
                     # Queue the sequence: content_block_stop -> content_block_start
-                    # The trigger chunk itself is not emitted as a delta since the
-                    # content_block_start already carries the relevant information.
+                    # For text blocks the trigger chunk is not emitted as a separate
+                    # delta because content_block_start carries the information.
+                    # For tool_use blocks we must also emit the trigger chunk's delta
+                    # when it carries input_json_delta data, because some providers
+                    # (e.g. xAI, Gemini) include tool arguments in the same streaming
+                    # chunk as the function name/id.
+
+                    # 1. Stop current content block
                     self.chunk_queue.append(
                         {
                             "type": "content_block_stop",
                             "index": max(self.current_content_block_index - 1, 0),
                         }
                     )
+
+                    # 2. Start new content block
                     self.chunk_queue.append(
                         {
                             "type": "content_block_start",
@@ -144,6 +152,17 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             "content_block": self.current_content_block_start,
                         }
                     )
+
+                    # 3. If the trigger chunk carries tool argument data, queue it
+                    # so the input_json_delta is not silently dropped.
+                    if (
+                        processed_chunk.get("type") == "content_block_delta"
+                        and isinstance(processed_chunk.get("delta"), dict)
+                        and processed_chunk["delta"].get("type") == "input_json_delta"
+                        and processed_chunk["delta"].get("partial_json")
+                    ):
+                        self.chunk_queue.append(processed_chunk)
+
                     self.sent_content_block_finish = False
                     return self.chunk_queue.popleft()
 
@@ -261,19 +280,37 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                     # Add usage to the held chunk
                     uncached_input_tokens = chunk.usage.prompt_tokens or 0
-                    if hasattr(chunk.usage, "prompt_tokens_details") and chunk.usage.prompt_tokens_details:
-                        cached_tokens = getattr(chunk.usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                    if (
+                        hasattr(chunk.usage, "prompt_tokens_details")
+                        and chunk.usage.prompt_tokens_details
+                    ):
+                        cached_tokens = (
+                            getattr(
+                                chunk.usage.prompt_tokens_details, "cached_tokens", 0
+                            )
+                            or 0
+                        )
                         uncached_input_tokens -= cached_tokens
-                    
+
                     usage_dict: UsageDelta = {
                         "input_tokens": uncached_input_tokens,
                         "output_tokens": chunk.usage.completion_tokens or 0,
                     }
                     # Add cache tokens if available (for prompt caching support)
-                    if hasattr(chunk.usage, "_cache_creation_input_tokens") and chunk.usage._cache_creation_input_tokens > 0:
-                        usage_dict["cache_creation_input_tokens"] = chunk.usage._cache_creation_input_tokens
-                    if hasattr(chunk.usage, "_cache_read_input_tokens") and chunk.usage._cache_read_input_tokens > 0:
-                        usage_dict["cache_read_input_tokens"] = chunk.usage._cache_read_input_tokens
+                    if (
+                        hasattr(chunk.usage, "_cache_creation_input_tokens")
+                        and chunk.usage._cache_creation_input_tokens > 0
+                    ):
+                        usage_dict["cache_creation_input_tokens"] = (
+                            chunk.usage._cache_creation_input_tokens
+                        )
+                    if (
+                        hasattr(chunk.usage, "_cache_read_input_tokens")
+                        and chunk.usage._cache_read_input_tokens > 0
+                    ):
+                        usage_dict["cache_read_input_tokens"] = (
+                            chunk.usage._cache_read_input_tokens
+                        )
                     merged_chunk["usage"] = usage_dict
 
                     # Queue the merged chunk and reset
@@ -287,8 +324,12 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
                         # Queue the sequence: content_block_stop -> content_block_start
-                        # The trigger chunk itself is not emitted as a delta since the
-                        # content_block_start already carries the relevant information.
+                        # For text blocks the trigger chunk is not emitted as a separate
+                        # delta because content_block_start carries the information.
+                        # For tool_use blocks we must also emit the trigger chunk's delta
+                        # when it carries input_json_delta data, because some providers
+                        # (e.g. xAI, Gemini) include tool arguments in the same streaming
+                        # chunk as the function name/id.
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -297,8 +338,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                                 "index": max(self.current_content_block_index - 1, 0),
                             }
                         )
-
-                        # 2. Start new content block
                         self.chunk_queue.append(
                             {
                                 "type": "content_block_start",
@@ -307,10 +346,19 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             }
                         )
 
+                        # 3. If the trigger chunk carries tool argument data, queue it
+                        # so the input_json_delta is not silently dropped.
+                        if (
+                            processed_chunk.get("type") == "content_block_delta"
+                            and isinstance(processed_chunk.get("delta"), dict)
+                            and processed_chunk["delta"].get("type")
+                            == "input_json_delta"
+                            and processed_chunk["delta"].get("partial_json")
+                        ):
+                            self.chunk_queue.append(processed_chunk)
+
                         # Reset state for new block
                         self.sent_content_block_finish = False
-
-                        # Return the first queued item
                         return self.chunk_queue.popleft()
 
                     if (
@@ -439,12 +487,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             from typing import cast
 
             from litellm.types.llms.anthropic import ToolUseBlock
-            
+
             tool_block = cast(ToolUseBlock, content_block_start)
-            
+
             if tool_block.get("name"):
                 truncated_name = tool_block["name"]
-                original_name = self.tool_name_mapping.get(truncated_name, truncated_name)
+                original_name = self.tool_name_mapping.get(
+                    truncated_name, truncated_name
+                )
                 tool_block["name"] = original_name
 
         if block_type != self.current_content_block_type:
@@ -458,7 +508,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             from typing import cast
 
             from litellm.types.llms.anthropic import ToolUseBlock
-            
+
             tool_block = cast(ToolUseBlock, content_block_start)
             if tool_block.get("name"):
                 self.current_content_block_type = block_type

@@ -25,9 +25,7 @@ def _get_minimal_error_response() -> httpx.Response:
     if _MINIMAL_ERROR_RESPONSE is None:
         _MINIMAL_ERROR_RESPONSE = httpx.Response(
             status_code=400,
-            request=httpx.Request(
-                method="GET", url="https://litellm.ai"
-            ),
+            request=httpx.Request(method="GET", url="https://litellm.ai"),
         )
     return _MINIMAL_ERROR_RESPONSE
 
@@ -283,7 +281,7 @@ class Timeout(openai.APITimeoutError):  # type: ignore
         return _message
 
 
-class PermissionDeniedError(openai.PermissionDeniedError):  # type:ignore
+class PermissionDeniedError(openai.PermissionDeniedError):  # type: ignore
     def __init__(
         self,
         message,
@@ -849,6 +847,7 @@ class BudgetExceededError(Exception):
     ):
         self.current_cost = current_cost
         self.max_budget = max_budget
+        self.status_code = 429
         message = (
             message
             or f"Budget has been exceeded! Current cost: {current_cost}, Max budget: {max_budget}"
@@ -996,7 +995,7 @@ class MidStreamFallbackError(ServiceUnavailableError):  # type: ignore
             max_retries=self.max_retries,
             num_retries=self.num_retries,
         )
-        
+
         # Restore the propagated status and original response/request objects
         self.status_code = int(original_status) if original_status is not None else 503
         self.response = _saved_response

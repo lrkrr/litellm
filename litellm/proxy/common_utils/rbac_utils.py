@@ -35,7 +35,11 @@ async def check_feature_access_for_user(
     ):
         return
 
-    from litellm.proxy.proxy_server import general_settings, prisma_client, user_api_key_cache
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        prisma_client,
+        user_api_key_cache,
+    )
 
     disable_flag = f"disable_{feature_name}_for_internal_users"
     allow_team_admins_flag = f"allow_{feature_name}_for_team_admins"
@@ -46,7 +50,9 @@ async def check_feature_access_for_user(
 
     # Feature is disabled.  Check if team/org admins are exempted.
     if general_settings.get(allow_team_admins_flag, False):
-        from litellm.proxy.management_endpoints.common_utils import _user_has_admin_privileges
+        from litellm.proxy.management_endpoints.common_utils import (
+            _user_has_admin_privileges,
+        )
 
         is_admin = await _user_has_admin_privileges(
             user_api_key_dict=user_api_key_dict,
@@ -60,5 +66,35 @@ async def check_feature_access_for_user(
         status_code=403,
         detail={
             "error": f"Access to {feature_name} is disabled for your role. Contact your proxy admin."
+        },
+    )
+
+
+async def check_org_admin_can_generate_keys(
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    """
+    Raise HTTP 403 if the caller is an org admin and key generation is
+    disabled for org admins via UI settings.
+
+    Only blocks the ORG_ADMIN role — proxy admins and all other roles are
+    unaffected, so those paths continue to be gated by their existing auth
+    checks.
+    """
+    if user_api_key_dict.user_role not in (
+        LitellmUserRoles.ORG_ADMIN,
+        LitellmUserRoles.ORG_ADMIN.value,
+    ):
+        return
+
+    from litellm.proxy.proxy_server import general_settings
+
+    if not general_settings.get("disable_key_generate_for_org_admin", False):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "key generation is disabled for org admins. Contact your proxy admin."
         },
     )
