@@ -1483,6 +1483,7 @@ class ReasoningSummaryTextDeltaEvent(BaseLiteLLMOpenAIResponseObject):
     type: Literal[ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA]
     item_id: str
     output_index: int
+    summary_index: int = 0
     delta: str
 
 
@@ -1491,7 +1492,7 @@ class ReasoningSummaryTextDoneEvent(BaseLiteLLMOpenAIResponseObject):
     item_id: str
     output_index: int
     sequence_number: int
-    summary_index: int
+    summary_index: int = 0
     text: str
 
 
@@ -1500,7 +1501,7 @@ class ReasoningSummaryPartDoneEvent(BaseLiteLLMOpenAIResponseObject):
     item_id: str
     output_index: int
     sequence_number: int
-    summary_index: int
+    summary_index: int = 0
     part: BaseLiteLLMOpenAIResponseObject
 
 
